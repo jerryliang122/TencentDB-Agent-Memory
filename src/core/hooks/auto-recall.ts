@@ -35,16 +35,25 @@ const RECALL_LINE_SEPARATOR = "\n";
 const MEMORY_TOOLS_GUIDE = `<memory-tools-guide>
 ## 记忆工具调用指南
 
-当上方注入的记忆片段不足以回答用户问题时，可主动调用以下工具获取更多信息：
+上方注入的记忆片段采用了"主题 + 内容首段提示 + record_id"的紧凑格式（默认 60 字提示），用于最小化上下文占用。当某条记忆的提示看起来相关、需要完整正文才能回答时，按下方优先级调用工具取回原文。
 
-- **tdai_memory_search**：搜索结构化记忆（L1），适用于回忆用户偏好、历史事件节点、规则等关键信息。
-- **tdai_conversation_search**：搜索原始对话（L0），适用于查找具体消息原文、时间线、上下文细节；也可用于补充或校验 memory_search 的结果。
-- **read_file**（Scene Navigation 中的路径）：当已定位到相关情境，且需要该场景的完整画像、事件经过或阶段结论时使用。
+可用工具（按推荐优先级）：
+
+- **tdai_memory_get**：按 record_id 取回单条记忆的完整正文（推荐首选）。
+  适用于"上方 <relevant-memories> 中某条标了 [id=m_xxx] 的记忆看起来相关"的场景。
+  参数：record_id（取自 [id=...] 标记）。
+- **tdai_memory_search**：搜索结构化记忆（L1）。
+  适用于回忆用户偏好、历史事件节点、规则等关键信息，或当上方未注入相关主题但你觉得应该存在时。
+  参数：query（关键词或自然语言描述）、可选 limit/type/scene 过滤。
+- **tdai_conversation_search**：搜索原始对话（L0）。
+  适用于查找具体消息原文、时间线、上下文细节；也可用于补充或校验 memory_search 的结果。
+- **read_file**（Scene Navigation 中的路径）：当已定位到相关情境、需要该场景的完整画像、事件经过或阶段结论时使用。
 
 ### ⚠️ 调用次数限制
-每轮对话中，tdai_memory_search 和 tdai_conversation_search **合计最多调用 3 次**。
-- 首次搜索无结果时，可换关键词或换工具重试，但总调用次数不要超过 3 次。
-- 若 3 次搜索后仍无结果，说明该信息不在记忆中，请直接根据已有信息回复用户，不要继续搜索。
+每轮对话中，tdai_memory_get / tdai_memory_search / tdai_conversation_search **合计最多调用 5 次**。
+- 推荐流程：先用 tdai_memory_get 取回注入过的记忆（命中率高、成本低），再用 tdai_memory_search 寻找新记忆。
+- 首次搜索无结果时，可换关键词或换工具重试，但总调用次数不要超过 5 次。
+- 若 5 次后仍无结果，说明该信息不在记忆中，请直接根据已有信息回复用户，不要继续搜索。
 </memory-tools-guide>`
 
 /** A single recalled L1 memory with its search score and type. */
@@ -333,13 +342,20 @@ async function searchMemories(
   const maxResults = cfg.recall.maxResults ?? 5;
   const threshold = cfg.recall.scoreThreshold ?? 0.3;
 
+  // Build format options from config — drives subject-only injection mode.
+  const formatOpts: FormatLineOptions = {
+    subjectOnly: cfg.recall.subjectOnly,
+    subjectHintChars: cfg.recall.subjectHintChars,
+  };
+
   const embeddingAvailable = !!vectorStore && !!embeddingService;
 
   logger?.debug?.(
     `${TAG} [searchMemories] strategy=${strategy}, embeddingAvailable=${embeddingAvailable}, ` +
     `vectorStore=${vectorStore ? "available" : "UNAVAILABLE"}, ` +
     `embeddingService=${embeddingService ? "available" : "UNAVAILABLE"}, ` +
-    `maxResults=${maxResults}, threshold=${threshold}`,
+    `maxResults=${maxResults}, threshold=${threshold}, ` +
+    `formatMode=${formatOpts.subjectOnly ? "subject" : "legacy"}(${formatOpts.subjectHintChars})`,
   );
 
   // Determine effective strategy (fall back to keyword if embedding not available)
@@ -361,13 +377,13 @@ async function searchMemories(
   try {
     if (effectiveStrategy === "keyword") {
       const tFts = performance.now();
-      const lines = await searchByKeyword(cleanText, pluginDataDir, maxResults, threshold, logger, vectorStore);
+      const lines = await searchByKeyword(cleanText, pluginDataDir, maxResults, threshold, logger, vectorStore, formatOpts);
       return { lines, timing: { ftsMs: performance.now() - tFts, embeddingMs: 0, ftsHits: lines.length, embeddingHits: 0 } };
     }
 
     if (effectiveStrategy === "embedding") {
       const tEmb = performance.now();
-      const lines = await searchByEmbedding(cleanText, maxResults, threshold, vectorStore!, embeddingService!, logger, embeddingCallOpts);
+      const lines = await searchByEmbedding(cleanText, maxResults, threshold, vectorStore!, embeddingService!, logger, embeddingCallOpts, formatOpts);
       return { lines, timing: { ftsMs: 0, embeddingMs: performance.now() - tEmb, ftsHits: 0, embeddingHits: lines.length } };
     }
 
@@ -379,12 +395,12 @@ async function searchMemories(
       const results = await vectorStore.searchL1Hybrid({ query: cleanText, topK: maxResults });
       const nativeMs = performance.now() - tNative;
       logger?.debug?.(`${TAG} [hybrid-native] Single-call hybrid: ${results.length} results in ${nativeMs.toFixed(0)}ms`);
-      const lines = results.map((r) => formatMemoryLine(vectorResultToFormatable(r)));
+      const lines = results.map((r) => formatMemoryLine(vectorResultToFormatable(r), formatOpts));
       return { lines, timing: { ftsMs: 0, embeddingMs: nativeMs, ftsHits: 0, embeddingHits: results.length } };
     }
 
     // Fallback: run keyword + embedding in parallel, merge with client-side RRF (SQLite path)
-    return await searchHybrid(cleanText, pluginDataDir, maxResults, threshold, vectorStore!, embeddingService!, logger, embeddingCallOpts);
+    return await searchHybrid(cleanText, pluginDataDir, maxResults, threshold, vectorStore!, embeddingService!, logger, embeddingCallOpts, formatOpts);
   } catch (err) {
     logger?.warn?.(`${TAG} Memory search failed (strategy=${effectiveStrategy}): ${err instanceof Error ? err.message : String(err)}`);
     return emptyResult;
@@ -402,6 +418,7 @@ async function searchByKeyword(
   threshold: number,
   logger?: Logger,
   vectorStore?: IMemoryStore,
+  formatOpts?: FormatLineOptions,
 ): Promise<string[]> {
   // Prefer FTS5 if available
   if (vectorStore?.isFtsAvailable()) {
@@ -420,7 +437,7 @@ async function searchByKeyword(
 
         if (filtered.length > 0) {
           logger?.debug?.(`${TAG} [keyword-fts] FTS5 found ${filtered.length} results (from ${ftsResults.length} raw, threshold=${threshold})`);
-          return filtered.map((r) => formatMemoryLine(ftsResultToFormatable(r)));
+          return filtered.map((r) => formatMemoryLine(ftsResultToFormatable(r), formatOpts ?? DEFAULT_FORMAT_OPTS));
         }
 
         // BM25 absolute scores are unreliable when the document set is very
@@ -431,7 +448,7 @@ async function searchByKeyword(
             `${TAG} [keyword-fts] All ${ftsResults.length} results below threshold=${threshold} ` +
             `but document set is small — returning all matched results`,
           );
-          return ftsResults.slice(0, maxResults).map((r) => formatMemoryLine(ftsResultToFormatable(r)));
+          return ftsResults.slice(0, maxResults).map((r) => formatMemoryLine(ftsResultToFormatable(r), formatOpts ?? DEFAULT_FORMAT_OPTS));
         }
         logger?.debug?.(`${TAG} [keyword-fts] FTS5 returned 0 results above threshold (from ${ftsResults.length} raw)`);
       }
@@ -447,6 +464,16 @@ async function searchByKeyword(
 // Strategy: Embedding (VectorStore cosine)
 // ============================
 
+/**
+ * Default format options used when caller doesn't pass any (e.g. tests,
+ * dead-code paths). Defaults to subjectOnly mode with 60-char hint,
+ * matching `parseConfig`'s production defaults.
+ */
+const DEFAULT_FORMAT_OPTS: FormatLineOptions = {
+  subjectOnly: true,
+  subjectHintChars: 60,
+};
+
 async function searchByEmbedding(
   userText: string,
   maxResults: number,
@@ -455,6 +482,7 @@ async function searchByEmbedding(
   embeddingService: EmbeddingService,
   logger?: Logger,
   embeddingCallOpts?: EmbeddingCallOptions,
+  formatOpts?: FormatLineOptions,
 ): Promise<string[]> {
   logger?.debug?.(
     `${TAG} [embedding-search] START query="${userText.slice(0, 80)}...", maxResults=${maxResults}, threshold=${threshold}`,
@@ -487,7 +515,7 @@ async function searchByEmbedding(
 
   if (filtered.length > 0) {
     logger?.debug?.(`${TAG} [embedding-search] Found ${filtered.length} relevant memories above threshold (from ${vecResults.length} candidates)`);
-    return filtered.map((r) => formatMemoryLine(vectorResultToFormatable(r)));
+    return filtered.map((r) => formatMemoryLine(vectorResultToFormatable(r), formatOpts ?? DEFAULT_FORMAT_OPTS));
   }
 
   logger?.debug?.(`${TAG} [embedding-search] No results above threshold ${threshold}`);
@@ -517,6 +545,7 @@ async function searchHybrid(
   embeddingService: EmbeddingService,
   logger?: Logger,
   embeddingCallOpts?: EmbeddingCallOptions,
+  formatOpts?: FormatLineOptions,
 ): Promise<SearchResult> {
   // Run keyword and embedding searches in parallel
   const candidateK = maxResults * 3; // retrieve more for merging
@@ -638,7 +667,7 @@ async function searchHybrid(
       `${TAG} Hybrid search found ${sorted.length} results ` +
       `(keyword=${keywordResults.length}, embedding=${embeddingResults.length})`,
     );
-    return { lines: sorted.map(([, { formatable }]) => formatMemoryLine(formatable)), timing };
+    return { lines: sorted.map(([, { formatable }]) => formatMemoryLine(formatable, formatOpts ?? DEFAULT_FORMAT_OPTS)), timing };
   }
 
   logger?.debug?.(`${TAG} Hybrid search: no results after merge`);
@@ -652,18 +681,23 @@ async function searchHybrid(
 /**
  * Format a single memory record into a rich natural-language line for prompt injection.
  *
+ * Two output modes, controlled by `opts.subjectOnly`:
+ *
+ * **subjectOnly=true** (default in v3): inject only a compact subject line:
+ *   - [type|scene_name] <content首N字 + "…"> (活动时间: ...) [id=m_xxx]
+ * The main agent fetches full content on demand via `tdai_memory_get(record_id)`.
+ * Set `subjectHintChars=0` for pure subject-only mode (no content fragment).
+ *
+ * **subjectOnly=false** (legacy): inject full content + time:
+ *   - [type|scene_name] <full content> (活动时间: ...)
+ * Truncation is then the responsibility of `applyRecallBudget`.
+ *
  * Time semantics:
  *   - timestamp (点时间): when the activity/event happened, e.g. "2025-03-01 mentioned something"
- *   - activity_start_time / activity_end_time (段时间): activity time range, e.g. "trip from 2025-05-01 to 2025-05-10"
+ *   - activity_start_time / activity_end_time (段时间): activity time range
  *   - All three time fields may be empty/undefined — handled gracefully.
- *
- * Output examples:
- *   - [persona] 用户叫王小明，30岁，是一名软件工程师。
- *   - [episodic|旅行计划] 用户计划五月去日本旅行。(活动时间: 2025-05-01 ~ 2025-05-10)
- *   - [episodic] 用户今天加班到很晚。(活动时间: 2025-03-01)
- *   - [instruction] 用户要求回答时使用中文，保持简洁。
  */
-interface FormatableMemory {
+export interface FormatableMemory {
   type: string;
   content: string;
   scene_name?: string;
@@ -673,36 +707,76 @@ interface FormatableMemory {
   activity_end_time?: string;
   /** Activity point-in-time (点时间: when it happened), may be empty */
   timestamp?: string;
+  /** Unique record ID — appended as `[id=...]` in subjectOnly mode so the
+   *  main agent can call `tdai_memory_get(record_id)` to fetch full content. */
+  record_id: string;
 }
 
-function formatMemoryLine(m: FormatableMemory): string {
+/** Options controlling `formatMemoryLine` output format. */
+export interface FormatLineOptions {
+  /** When true, emit subject-only mode (compact line + `[id=...]`).
+   *  When false, emit legacy full-content line (no `[id=...]` suffix). */
+  subjectOnly: boolean;
+  /** Content hint length (code points) for subjectOnly mode.
+   *  0 = no content fragment (pure subject line).
+   *  Default effective value is 60 (set by caller from `cfg.recall.subjectHintChars`). */
+  subjectHintChars?: number;
+}
+
+export function formatMemoryLine(m: FormatableMemory, opts: FormatLineOptions): string {
   // 1. Type tag + optional scene name
   const tag = m.scene_name ? `${m.type}|${m.scene_name}` : m.type;
 
-  // 2. Content (core)
-  let line = `- [${tag}] ${m.content}`;
-
-  // 3. Time info — prefer activity_start/end range; fall back to timestamp as point-in-time
+  // 2. Time info — prefer activity_start/end range; fall back to timestamp as point-in-time
   const start = formatTimestamp(m.activity_start_time);
   const end = formatTimestamp(m.activity_end_time);
   const point = formatTimestamp(m.timestamp);
 
+  let timeInfo = "";
   if (start && end) {
-    // 段时间: both start and end
-    line += ` (活动时间: ${start} ~ ${end})`;
+    timeInfo = ` (活动时间: ${start} ~ ${end})`;
   } else if (start) {
-    // 段时间: only start
-    line += ` (活动时间: ${start}起)`;
+    timeInfo = ` (活动时间: ${start}起)`;
   } else if (end) {
-    // 段时间: only end
-    line += ` (活动时间: 至${end})`;
+    timeInfo = ` (活动时间: 至${end})`;
   } else if (point) {
-    // 点时间: single timestamp
-    line += ` (活动时间: ${point})`;
+    timeInfo = ` (活动时间: ${point})`;
   }
-  // If all three are empty → no time info appended (graceful)
 
-  return line;
+  // 3. Branch on mode
+  if (!opts.subjectOnly) {
+    // Legacy mode: full content + time, no record_id suffix
+    return `- [${tag}] ${m.content}${timeInfo}`;
+  }
+
+  // Subject-only mode: hint + record_id suffix
+  const hintChars = opts.subjectHintChars ?? 60;
+  let hint = "";
+  if (hintChars > 0 && m.content) {
+    // Normalize newlines to spaces so the bullet stays single-line
+    // (production content frequently starts with "首行：\n\n【section】...")
+    const normalized = m.content.replace(/\s*\n\s*/g, " ");
+    hint = ` ${truncateHint(normalized, hintChars)}`;
+  }
+
+  return `- [${tag}]${hint}${timeInfo} [id=${m.record_id}]`;
+}
+
+/**
+ * Truncate content to `maxChars` code points, appending an ellipsis ("…")
+ * when truncation actually happened. When content fits within the budget,
+ * returns it unchanged (no ellipsis).
+ *
+ * The single-char ellipsis replaces the legacy verbose
+ * `RECALL_TRUNCATION_SUFFIX` ("…（已截断；可用 tdai_memory_search 查看详情）")
+ * because the new subject-only mode is *always* a hint — the suffix would
+ * be redundant. (Legacy mode still uses the verbose suffix via
+ * `applyRecallBudget` + `truncateRecallLine`.)
+ */
+function truncateHint(content: string, maxChars: number): string {
+  const cps = Array.from(content);
+  if (cps.length <= maxChars) return content;
+  return `${cps.slice(0, maxChars).join("").trimEnd()}…`;
 }
 
 function applyRecallBudget(
@@ -819,6 +893,7 @@ function formatTimestamp(ts: string | undefined): string | undefined {
 function recordToFormatable(record: MemoryRecord): FormatableMemory {
   const meta = record.metadata as { activity_start_time?: string; activity_end_time?: string } | undefined;
   return {
+    record_id: record.id,
     type: record.type,
     content: record.content,
     scene_name: record.scene_name || undefined,
@@ -843,6 +918,7 @@ function vectorResultToFormatable(r: L1SearchResult): FormatableMemory {
     } catch { /* ignore parse errors — treat as no metadata */ }
   }
   return {
+    record_id: r.record_id,
     type: r.type,
     content: r.content,
     scene_name: r.scene_name || undefined,
@@ -867,6 +943,7 @@ function ftsResultToFormatable(r: L1FtsResult): FormatableMemory {
     } catch { /* ignore parse errors — treat as no metadata */ }
   }
   return {
+    record_id: r.record_id,
     type: r.type,
     content: r.content,
     scene_name: r.scene_name || undefined,

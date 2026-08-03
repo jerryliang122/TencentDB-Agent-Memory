@@ -79,7 +79,9 @@
           "maxTotalRecallChars": { "type": "number", "default": 0, "description": "本轮 auto-recall 注入的 L1 记忆总字符预算；填 0 表示不限制" },
           "scoreThreshold": { "type": "number", "default": 0.3, "description": "最低分数阈值" },
           "strategy": { "type": "string", "enum": ["embedding", "keyword", "hybrid"], "default": "hybrid", "description": "搜索策略：keyword(关键词)、embedding(向量)、hybrid(混合RRF融合，推荐)" },
-          "timeoutMs": { "type": "number", "default": 5000, "description": "召回整体超时（毫秒），超时后跳过记忆注入并打印警告日志" }
+          "timeoutMs": { "type": "number", "default": 5000, "description": "召回整体超时（毫秒），超时后跳过记忆注入并打印警告日志" },
+          "subjectOnly": { "type": "boolean", "default": true, "description": "仅注入记忆主题（scene_name + content 首 N 字 + record_id）到提示词，而非完整 content。主 agent 通过 tdai_memory_get(record_id) 工具按需取回完整正文。设为 false 回退到旧的完整 content + 截断行为" },
+          "subjectHintChars": { "type": "integer", "default": 60, "minimum": 0, "maximum": 500, "description": "subjectOnly=true 时 content 首段提示字符数（按 Unicode code point 计）。0 = 纯主题模式（不注入任何 content 片段，仅靠 scene_name + type + 时间判断是否取回原文）；>0 = 主题 + 首 N 字 + '…'。仅 subjectOnly=true 时生效" }
         }
       },
       "embedding": {

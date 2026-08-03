@@ -264,6 +264,20 @@ export interface IMemoryStore {
   queryL1Records(filter?: L1QueryFilter): MaybePromise<L1RecordRow[]>;
   getAllL1Texts(): MaybePromise<Array<{ record_id: string; content: string; updated_time: string }>>;
 
+  /**
+   * Fetch a single L1 record by its `record_id`.
+   *
+   * Used by the `tdai_memory_get` tool to retrieve the full content of a
+   * recalled memory on demand (after auto-recall has injected only the
+   * subject + hint + record_id into the prompt).
+   *
+   * @returns The matching record, or `null` if not found (deleted, merged,
+   *          or never existed). Implementations MUST NOT throw on miss -
+   *          return `null` so callers can format a friendly "not found"
+   *          response without try/catch noise.
+   */
+  getL1ById(recordId: string): MaybePromise<L1RecordRow | null>;
+
   // ── L1 Search ────────────────────────────────────────────
 
   searchL1Vector(queryEmbedding: Float32Array, topK?: number, queryText?: string): MaybePromise<L1SearchResult[]>;

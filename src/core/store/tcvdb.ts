@@ -610,6 +610,65 @@ export class TcvdbMemoryStore implements IMemoryStore {
     }
   }
 
+  /**
+   * Fetch a single L1 record by its `record_id`.
+   *
+   * Used by the `tdai_memory_get` tool to retrieve full content on demand.
+   *
+   * TCVDB note: `id` is the document's primary key but is not always exposed
+   * via the standard `filter` expression syntax across TCVDB versions. This
+   * implementation uses `_queryAllDocs` with an `id = "..."` filter; if the
+   * filter doesn't match (returns empty), we return null. The catch path
+   * also returns null so TCVDB users still get a friendly "not found"
+   * message via `executeMemoryGet`.
+   */
+  async getL1ById(recordId: string): Promise<L1RecordRow | null> {
+    try {
+      await this._ensureInit();
+      if (this.degraded) return null;
+      if (!recordId) return null;
+
+      // TCVDB filter expression — note the single-quote string literal convention
+      // matches the existing queryL1Records pattern (which uses double quotes
+      // for session_key/session_id; we use single quotes here to allow recordId
+      // to contain double quotes safely, though in practice record IDs are
+      // `m_<digits>_<hex>` and contain neither).
+      const filter = `id = "${recordId}"`;
+
+      const docs = await this._queryAllDocs(
+        this.l1Collection,
+        filter,
+        L1_OUTPUT_FIELDS,
+        1, // limit — we only need one
+      );
+
+      if (docs.length === 0) return null;
+      const doc = docs[0]!;
+
+      return {
+        record_id: String(doc.id ?? ""),
+        content: String(doc.text ?? ""),
+        type: String(doc.type ?? ""),
+        priority: Number(doc.priority ?? 0),
+        scene_name: String(doc.scene_name ?? ""),
+        session_key: String(doc.session_key ?? ""),
+        session_id: String(doc.session_id ?? ""),
+        timestamp_str: String(doc.timestamp_str ?? ""),
+        timestamp_start: String(doc.timestamp_start ?? ""),
+        timestamp_end: String(doc.timestamp_end ?? ""),
+        created_time: epochMsToIso(Number(doc.created_time_ms ?? 0)),
+        updated_time: epochMsToIso(Number(doc.updated_time_ms ?? 0)),
+        metadata_json: String(doc.metadata_json ?? "{}"),
+      };
+    } catch (err) {
+      this.logger?.warn?.(
+        `${TAG} [L1-get] FAILED id=${recordId}: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return null;
+    }
+  }
+
   async getAllL1Texts(): Promise<Array<{ record_id: string; content: string; updated_time: string }>> {
     try {
       await this._ensureInit();

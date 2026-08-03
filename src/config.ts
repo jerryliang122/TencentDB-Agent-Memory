@@ -93,6 +93,32 @@ export interface RecallConfig {
   strategy: "embedding" | "keyword" | "hybrid";
   /** Overall recall timeout in milliseconds (default: 5000). When exceeded, recall is skipped with a warning. */
   timeoutMs: number;
+  /**
+   * Inject only memory subject (scene_name) + content hint + record_id into
+   * the prompt, instead of full content (default: true).
+   *
+   * When `true`, each recalled memory is rendered as a compact single line:
+   *   `- [type|scene] <content首N字 + "…"> (活动时间: ...) [id=m_xxx]`
+   * The main agent then fetches full content on demand via the
+   * `tdai_memory_get(record_id)` tool when it decides the line is relevant.
+   *
+   * When `false`, falls back to legacy behavior: full content injection
+   * with `maxCharsPerMemory` truncation (no `[id=...]` suffix).
+   */
+  subjectOnly: boolean;
+  /**
+   * Number of leading content characters (counted by Unicode code point)
+   * to include as a "hint" when `subjectOnly=true`.
+   *
+   * - `0` = pure subject-only mode (no content fragment at all — the LLM
+   *   must rely solely on scene_name + type + time to decide whether to
+   *   fetch the full content via `tdai_memory_get`).
+   * - `>0` = subject + first N chars + `…` (single-char ellipsis).
+   *
+   * Default: 60. Clamped to `[0, 500]` by `parseConfig`. Only effective
+   * when `subjectOnly=true`.
+   */
+  subjectHintChars: number;
 }
 
 /** Embedding service configuration for vector search. */
@@ -535,6 +561,8 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       scoreThreshold: num(recallGroup, "scoreThreshold") ?? 0.3,
       strategy: validateStrategy(str(recallGroup, "strategy")) ?? "hybrid",
       timeoutMs: num(recallGroup, "timeoutMs") ?? 5000,
+      subjectOnly: bool(recallGroup, "subjectOnly") ?? true,
+      subjectHintChars: clampSubjectHintChars(num(recallGroup, "subjectHintChars") ?? 60),
     },
     embedding: {
       enabled: embeddingEnabled,
@@ -644,6 +672,23 @@ function validateStrategy(value: string | undefined): RecallConfig["strategy"] |
   return VALID_STRATEGIES.includes(value as RecallConfig["strategy"])
     ? (value as RecallConfig["strategy"])
     : undefined;
+}
+
+/**
+ * Clamp `recall.subjectHintChars` to the valid range `[0, 500]`.
+ *
+ * Defensive: the plugin JSON schema declares `minimum: 0, maximum: 500`, but
+ * users editing `opencode.json` directly can bypass that. Without clamping,
+ * a malicious or mistaken value like 100000 could let a single memory hint
+ * dominate the entire prompt budget. The clamp keeps hint bounded regardless
+ * of how the config was authored.
+ *
+ * Negative or non-finite values fall back to the default (60).
+ */
+function clampSubjectHintChars(value: number | undefined): number {
+  if (value == null || !Number.isFinite(value)) return 60;
+  if (value < 0) return 60;
+  return Math.min(Math.floor(value), 500);
 }
 
 /**
