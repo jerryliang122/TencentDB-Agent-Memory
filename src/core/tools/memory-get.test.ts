@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { executeMemoryGet, formatMemoryGetResponse } from "./memory-get.js";
+import { executeMemoryGet, formatMemoryGetResponse, sanitizeToolError } from "./memory-get.js";
 import type { IMemoryStore, L1RecordRow } from "../store/types.js";
 
 const TAG = "[memory-tdai][tdai_memory_get]";
@@ -178,5 +178,78 @@ describe("formatMemoryGetResponse", () => {
 
     expect(result).toContain("m_deleted_xyz");
     expect(result).toMatch(/not found/i);
+  });
+});
+
+describe("sanitizeToolError", () => {
+  // Security contract: raw error messages from store/runtime internals
+  // (SQL errors, file paths, stack traces, etc.) must NEVER reach the LLM
+  // agent. The agent only sees a generic user-facing message + generic code;
+  // the full original error is preserved separately for logs/telemetry.
+
+  const SENSITIVE_PATTERNS = [
+    /sqlite/i,
+    /SQLITE_/,
+    /disk I\/O error/i,
+    /\/tmp\//,             // file path leak
+    /\/root\//,
+    /ENOENT/,
+    /stack trace/i,
+  ];
+
+  function assertNoLeak(got: { userMessage: string; errorCode: string }) {
+    for (const re of SENSITIVE_PATTERNS) {
+      expect(got.userMessage).not.toMatch(re);
+      expect(got.errorCode).not.toMatch(re);
+    }
+  }
+
+  it("returns generic message for Error instance with SQL error details", () => {
+    const err = new Error("sqlite: disk I/O error at /root/.openclaw/memory-tdai/vectors.db");
+    const result = sanitizeToolError(err);
+
+    expect(result.userMessage).toMatch(/Memory get failed/i);
+    expect(result.userMessage).toMatch(/tdai_memory_search/i); // suggests fallback
+    expect(result.errorCode).toBe("internal_error");
+    // Internal detail preserved for logs, NOT for LLM
+    expect(result.internalError).toContain("sqlite: disk I/O error");
+    assertNoLeak(result);
+  });
+
+  it("returns generic message for string error", () => {
+    const err = "ENOENT: no such file or directory, open '/root/.openclaw/vectors.db'";
+    const result = sanitizeToolError(err);
+
+    expect(result.errorCode).toBe("internal_error");
+    assertNoLeak(result);
+    // Original preserved internally
+    expect(result.internalError).toContain("ENOENT");
+  });
+
+  it("returns generic message for non-Error thrown object", () => {
+    const err = { code: "SQLITE_BUSY", message: "database is locked", stack: "..." };
+    const result = sanitizeToolError(err);
+
+    expect(result.errorCode).toBe("internal_error");
+    assertNoLeak(result);
+  });
+
+  it("preserves the original error verbatim in internalError for log/telemetry use", () => {
+    const original = "some weird internal detail: foo=42, path=/etc/secrets";
+    const result = sanitizeToolError(new Error(original));
+
+    expect(result.internalError).toBe(original);
+  });
+
+  it("handles null/undefined thrown values without throwing itself", () => {
+    expect(() => sanitizeToolError(null)).not.toThrow();
+    expect(() => sanitizeToolError(undefined)).not.toThrow();
+
+    const r1 = sanitizeToolError(null);
+    const r2 = sanitizeToolError(undefined);
+    expect(r1.errorCode).toBe("internal_error");
+    expect(r2.errorCode).toBe("internal_error");
+    assertNoLeak(r1);
+    assertNoLeak(r2);
   });
 });
