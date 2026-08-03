@@ -39,6 +39,7 @@ import { ensureL2L3Local } from "./src/core/profile/profile-sync.js";
 // Core abstractions (host-neutral)
 import { OpenClawHostAdapter } from "./src/adapters/openclaw/host-adapter.js";
 import { TdaiCore } from "./src/core/tdai-core.js";
+import { sanitizeToolError } from "./src/core/tools/memory-get.js";
 import {
   ensurePluginHookPolicy,
   decideHookPolicy,
@@ -504,18 +505,21 @@ export default function register(api: OpenClawPluginApi) {
           };
         } catch (err) {
           const elapsedMs = Date.now() - startMs;
-          const errMsg = err instanceof Error ? err.message : String(err);
-          api.logger.error(`${TAG} [tool] tdai_memory_get failed (${elapsedMs}ms): ${errMsg}`);
+          // Sanitize error: the LLM agent must never see internal error
+          // details (SQL errors, file paths, stack traces). Full error is
+          // preserved in `internalError` for logs + telemetry only.
+          const { userMessage, errorCode, internalError } = sanitizeToolError(err);
+          api.logger.error(`${TAG} [tool] tdai_memory_get failed (${elapsedMs}ms): ${internalError}`);
           report("tool_call", {
             tool: "tdai_memory_get",
             recordId,
             durationMs: elapsedMs,
             success: false,
-            error: errMsg,
+            error: internalError,
           });
           return {
-            content: [{ type: "text" as const, text: `Memory get failed: ${errMsg}` }],
-            details: { error: errMsg },
+            content: [{ type: "text" as const, text: userMessage }],
+            details: { error: errorCode },
           };
         }
       },

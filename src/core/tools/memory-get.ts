@@ -30,6 +30,79 @@ export interface MemoryGetResult {
 }
 
 // ============================
+// Tool error sanitization
+// ============================
+
+/**
+ * Result of sanitizing a raw error for tool-call response.
+ *
+ * Security contract: the LLM agent must NEVER see internal error details
+ * (SQL errors, file paths, stack traces, etc.) because:
+ *   1. They leak implementation details to the end user via the agent's reply.
+ *   2. They can confuse the agent into "fixing" the wrong thing.
+ *   3. They may contain sensitive paths or identifiers.
+ *
+ * The full original error is preserved in `internalError` for log/telemetry
+ * use only; the agent only sees `userMessage` + `errorCode`.
+ */
+export interface SanitizedToolError {
+  /** Generic user-facing message. Safe to surface to the LLM agent. */
+  userMessage: string;
+  /** Generic error code (no internal details). Safe for `details` field. */
+  errorCode: string;
+  /** Original error message - for log/telemetry only, NEVER for LLM. */
+  internalError: string;
+}
+
+/**
+ * Generic user-facing message for unexpected tool failures.
+ *
+ * Kept as a constant (not constructed from `err`) so no internal detail can
+ * accidentally leak. The agent gets enough context to know the operation
+ * failed and what to try instead (tdai_memory_search as fallback), without
+ * any implementation specifics.
+ */
+const TOOL_ERROR_USER_MESSAGE =
+  "Memory get failed: internal error. The full error has been logged. " +
+  "Try tdai_memory_search to find the memory by content/scene instead.";
+
+/**
+ * Sanitize a thrown value from a tool's execute path into a safe response.
+ *
+ * Handles Error instances, strings, plain objects, and null/undefined
+ * (defensive against `throw null` and similar edge cases).
+ *
+ * The original error message is preserved verbatim in `internalError` so
+ * `api.logger.error(...)` and `report("tool_call", { error: ... })` can
+ * still carry the full detail for debugging - those channels are
+ * internal-only and never reach the LLM agent.
+ */
+export function sanitizeToolError(err: unknown): SanitizedToolError {
+  let internalError: string;
+  if (err instanceof Error) {
+    internalError = err.message;
+  } else if (typeof err === "string") {
+    internalError = err;
+  } else if (err == null) {
+    internalError = String(err);
+  } else {
+    // Objects (e.g. `{ code: "SQLITE_BUSY" }`) - coerce to string but
+    // preserve as much info as possible for internal logs.
+    try {
+      internalError = JSON.stringify(err);
+    } catch {
+      internalError = String(err);
+    }
+  }
+
+  return {
+    userMessage: TOOL_ERROR_USER_MESSAGE,
+    errorCode: "internal_error",
+    internalError,
+  };
+}
+
+// ============================
 // Tool implementation
 // ============================
 
