@@ -368,6 +368,8 @@ export class VectorStore implements IMemoryStore {
   private stmtQueryBySessionKeySince!: StatementSync;
   private stmtQueryAll!: StatementSync;
   private stmtQueryAllSince!: StatementSync;
+  /** Lookup single L1 record by record_id (returns full L1RecordRow). */
+  private stmtGetL1ById!: StatementSync;
 
   // Prepared statements — L0 (initialized in init())
   private stmtL0UpsertMeta!: StatementSync;
@@ -895,6 +897,14 @@ export class VectorStore implements IMemoryStore {
       LIMIT ?
     `);
 
+    // Single-record lookup by primary key — used by tdai_memory_get tool.
+    // Returns full L1RecordRow (all 13 columns) for on-demand full-content
+    // fetch after auto-recall injects only subject + hint + record_id.
+    this.stmtGetL1ById = this.db.prepare(`
+      SELECT ${l1QueryCols} FROM l1_records
+      WHERE record_id = ?
+    `);
+
     this.logger?.debug?.(`${TAG} Initialized (dimensions=${this.dimensions})`);
 
     return { needsReindex, reason: reindexReason };
@@ -1405,6 +1415,32 @@ export class VectorStore implements IMemoryStore {
         `${TAG} [L1-query] FAILED (non-fatal, returning empty): ${err instanceof Error ? err.message : String(err)}`
       );
       return [];
+    }
+  }
+
+  /**
+   * Fetch a single L1 record by its `record_id`.
+   *
+   * Used by the `tdai_memory_get` tool to retrieve full content on demand
+   * after auto-recall has injected only the subject + hint + record_id.
+   *
+   * **Fault-tolerant**: returns `null` on miss or any error (never throws),
+   * so callers can format a friendly "not found" response without try/catch.
+   */
+  getL1ById(recordId: string): L1RecordRow | null {
+    if (this.degraded) {
+      this.logger?.warn?.(`${TAG} [L1-get] SKIPPED (degraded mode) record_id=${recordId}`);
+      return null;
+    }
+    try {
+      const row = this.stmtGetL1ById.get(recordId) as L1RecordRow | undefined;
+      return row ?? null;
+    } catch (err) {
+      this.logger?.warn?.(
+        `${TAG} [L1-get] FAILED (non-fatal, returning null) record_id=${recordId}: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return null;
     }
   }
 

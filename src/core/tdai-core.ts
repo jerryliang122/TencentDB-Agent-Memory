@@ -35,6 +35,7 @@ import type { EmbeddingService } from "./store/embedding.js";
 import { performAutoRecall } from "./hooks/auto-recall.js";
 import { performAutoCapture } from "./hooks/auto-capture.js";
 import { executeMemorySearch, formatSearchResponse } from "./tools/memory-search.js";
+import { executeMemoryGet, formatMemoryGetResponse } from "./tools/memory-get.js";
 import { executeConversationSearch, formatConversationSearchResponse } from "./tools/conversation-search.js";
 import {
   initDataDirectories,
@@ -302,6 +303,27 @@ export class TdaiCore {
       text: formatSearchResponse(result),
       total: result.total,
       strategy: result.strategy,
+    };
+  }
+
+  /**
+   * Fetch a single L1 memory record by `record_id`.
+   * Maps to: `tdai_memory_get` tool — used by the main agent to retrieve
+   * full content of a recalled memory on demand (after auto-recall injects
+   * only the subject + hint + record_id into the prompt).
+   */
+  async getMemory(recordId: string): Promise<{ text: string; found: boolean }> {
+    await this.storeReady?.catch(() => {});
+
+    const result = await executeMemoryGet({
+      recordId,
+      vectorStore: this.vectorStore,
+      logger: this.logger,
+    });
+
+    return {
+      text: formatMemoryGetResponse(result),
+      found: result.found,
     };
   }
 

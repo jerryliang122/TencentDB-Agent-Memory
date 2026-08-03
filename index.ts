@@ -434,6 +434,95 @@ export default function register(api: OpenClawPluginApi) {
     { name: "tdai_memory_search" },
   );
 
+  // tdai_memory_get — Agent-callable single-record fetch tool (companion to
+  // subject-only auto-recall injection). When recall injects only the subject
+  // + hint + record_id into the prompt, the main agent uses this tool to
+  // fetch the full content of a specific memory on demand.
+  // TODO: implement hard per-turn call limit via before_tool_call hook + execute early-return (方案 D)
+  api.registerTool(
+    {
+      name: "tdai_memory_get",
+      label: "Memory Get",
+      description:
+        "Fetch the full content of a single memory record by its record_id. " +
+        "Use this when an auto-recalled memory subject (the [id=...] line in <relevant-memories>) " +
+        "looks relevant and you need the complete content to answer. " +
+        "Cheaper and more precise than tdai_memory_search when you already have a specific record_id. " +
+        "Limit: shares the per-turn 5-call budget with tdai_memory_search and tdai_conversation_search.",
+      parameters: {
+        type: "object",
+        properties: {
+          record_id: {
+            type: "string",
+            description: "The record_id from a recalled memory line, e.g. m_1785515129486_dee4cb6c",
+          },
+        },
+        required: ["record_id"],
+      },
+      async execute(_toolCallId: string, params: Record<string, unknown>) {
+        const startMs = Date.now();
+        const recordId = String(params.record_id ?? "").trim();
+
+        api.logger.debug?.(
+          `${TAG} [tool] tdai_memory_get called: record_id=${recordId || "(empty)"}`,
+        );
+
+        if (!recordId) {
+          const elapsedMs = Date.now() - startMs;
+          api.logger.warn?.(`${TAG} [tool] tdai_memory_get called with empty record_id (${elapsedMs}ms)`);
+          report("tool_call", {
+            tool: "tdai_memory_get",
+            recordId: "",
+            durationMs: elapsedMs,
+            success: false,
+            error: "empty record_id",
+          });
+          return {
+            content: [{ type: "text" as const, text: "record_id is required." }],
+            details: { error: "empty record_id" },
+          };
+        }
+
+        try {
+          const result = await core.getMemory(recordId);
+
+          const elapsedMs = Date.now() - startMs;
+          api.logger.debug?.(
+            `${TAG} [tool] tdai_memory_get completed (${elapsedMs}ms): ` +
+            `found=${result.found}, responseLength=${result.text.length} chars`,
+          );
+          report("tool_call", {
+            tool: "tdai_memory_get",
+            recordId,
+            found: result.found,
+            durationMs: elapsedMs,
+            success: true,
+          });
+          return {
+            content: [{ type: "text" as const, text: result.text }],
+            details: { found: result.found },
+          };
+        } catch (err) {
+          const elapsedMs = Date.now() - startMs;
+          const errMsg = err instanceof Error ? err.message : String(err);
+          api.logger.error(`${TAG} [tool] tdai_memory_get failed (${elapsedMs}ms): ${errMsg}`);
+          report("tool_call", {
+            tool: "tdai_memory_get",
+            recordId,
+            durationMs: elapsedMs,
+            success: false,
+            error: errMsg,
+          });
+          return {
+            content: [{ type: "text" as const, text: `Memory get failed: ${errMsg}` }],
+            details: { error: errMsg },
+          };
+        }
+      },
+    },
+    { name: "tdai_memory_get" },
+  );
+
   // tdai_conversation_search — Agent-callable L0 conversation search tool
   // TODO: implement hard per-turn call limit via before_tool_call hook + execute early-return (方案 D)
   api.registerTool(

@@ -8,6 +8,17 @@
 
 ### ✨ 新功能
 
+- **L1 自动召回注入格式改造（subject-only 模式）**：召回的 L1 记忆不再注入完整 `content`，改为紧凑的"主题 + 内容首段提示 + record_id"单行格式：
+  ```
+  - [type|scene_name] <content 首 N 字 + "…"> (活动时间: ...) [id=m_xxx]
+  ```
+  生产数据（2105 条记忆，content 平均 344 字符、最长 6734 字符）实测：召回 5 条最长记忆的总注入从 25386 字符降至 1003 字符（**96.0% 减少**），彻底消除截断产生的歧义前缀和数据污染问题。
+  - 主 agent 看到紧凑主题后，按需调用新增的 **`tdai_memory_get(record_id)`** 工具取回完整正文（精确单点查询，<5ms）。
+  - 工具调用次数上限从 **3 次/轮** 提升至 **5 次/轮**（涵盖 search→get×N 的典型流程）。
+  - 新增配置：`recall.subjectOnly`（默认 `true`，新行为；设 `false` 回退旧的完整 content + 截断）、`recall.subjectHintChars`（默认 60；设 `0` 为纯主题模式 `[type|scene] (time) [id=m_xxx]`，不注入任何 content 片段；自动 clamp 到 `[0, 500]`）。
+  - **数据迁移**：无需 - 复用现有 `record_id`（PRIMARY KEY）和 `metadata_json` 字段；不新增 SQL 列。
+  - **配置迁移**：未配新字段的用户默认获得新行为；想保留旧行为需显式 `recall.subjectOnly: false`。
+  - `MEMORY_TOOLS_GUIDE` 提示文本更新，说明新工具调用优先级和流程。
 - **时区可配置** ([#75](https://github.com/Tencent/TencentDB-Agent-Memory/issues/75) / [#87](https://github.com/Tencent/TencentDB-Agent-Memory/issues/87))：新增顶层 `timezone` 配置项，支持 IANA 时区名（`Asia/Shanghai`、`Europe/Berlin`）和 UTC 偏移串（`+08:00`、`-05:30`）。默认 `"system"`（跟随进程系统时区），升级零感。
   - **暴露给 LLM 的时间戳**统一为带显式 offset 的 ISO 8601（如 `2026-04-07T11:04:45+08:00`），修复 #87 报告的 UTC/本地时区混用导致 LLM 误算时间差的问题。
   - **L1 / L2 prompt 顶部**自动插入时区声明，指引 LLM 按正确时区推算"昨天"、"上周"等相对时间。
