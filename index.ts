@@ -306,6 +306,7 @@ export default function register(api: OpenClawPluginApi) {
         retentionDays: cfg.memoryCleanup.retentionDays,
         cleanTime: cfg.memoryCleanup.cleanTime,
         logger: api.logger,
+        sceneTtlDays: cfg.persona.sceneTtlDays,
       });
       sharedMemoryCleaner.start();
       api.logger.debug?.(`${TAG} Memory cleaner started (singleton)`);
