@@ -311,17 +311,24 @@ export class LocalMemoryCleaner {
       return;
     }
 
-    type SceneInfo = { filename: string; updatedMs: number; heat: number };
+    type SceneInfo = { filename: string; updatedMs: number; heat: number; ageKnown: boolean };
     const scenes: SceneInfo[] = [];
     for (const file of files) {
       try {
         const raw = await fs.readFile(path.join(sceneDir, file), "utf-8");
         const block = parseSceneBlock(raw, file);
-        const updatedMs = Date.parse(block.meta.updated);
+        const parsedMs = Date.parse(block.meta.updated);
+        const ageKnown = Number.isFinite(parsedMs);
+        if (!ageKnown) {
+          this.opts.logger?.warn?.(
+            `${TAG} L2 cleanup: ${file} has unparseable META.updated="${block.meta.updated}" — skipping (safer than deleting based on coerced age)`,
+          );
+        }
         scenes.push({
           filename: file,
-          updatedMs: Number.isFinite(updatedMs) ? updatedMs : 0,
+          updatedMs: ageKnown ? parsedMs : 0,
           heat: block.meta.heat,
+          ageKnown,
         });
       } catch {
         // Skip unreadable files
@@ -331,9 +338,18 @@ export class LocalMemoryCleaner {
     const byHeat = [...scenes].sort((a, b) => b.heat - a.heat);
     const protectedFilenames = new Set(byHeat.slice(0, MIN_RETAIN_SCENES).map((s) => s.filename));
 
+    // Only delete scenes with a known, parseable updated timestamp that is past TTL.
+    // Scenes with unparseable timestamps are preserved (can't age them safely).
     const expired = scenes.filter(
-      (s) => !protectedFilenames.has(s.filename) && s.updatedMs < cutoffMs,
+      (s) => s.ageKnown && !protectedFilenames.has(s.filename) && s.updatedMs < cutoffMs,
     );
+
+    const skippedUnknownAge = scenes.filter((s) => !s.ageKnown).length;
+    if (skippedUnknownAge > 0) {
+      this.opts.logger?.info?.(
+        `${TAG} L2 cleanup: preserved ${skippedUnknownAge} scene(s) with unparseable updated timestamp`,
+      );
+    }
 
     if (expired.length === 0) {
       this.opts.logger?.debug?.(`${TAG} L2 cleanup: no expired scenes`);
