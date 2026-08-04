@@ -82,6 +82,55 @@ export function parsePersonaUpdateSignal(text: string): { reason: string } | nul
   return null;
 }
 
+/**
+ * Parse LLM text output for PROPOSE_CANDIDATE signals.
+ *
+ * Block format:
+ *   [PROPOSE_CANDIDATE]
+ *   topic: <topic name>
+ *   reason: <reason text>
+ *   matched_memory_ids: [m_001, m_002]
+ *   [/PROPOSE_CANDIDATE]
+ *
+ * Multiple blocks are supported. Fields `reason` and `matched_memory_ids`
+ * are optional (reason defaults to empty string, ids to empty array).
+ */
+export interface ProposedCandidate {
+  topic: string;
+  reason: string;
+  matched_memory_ids: string[];
+}
+
+export function parseProposeCandidateSignals(text: string): ProposedCandidate[] {
+  const signals: ProposedCandidate[] = [];
+  const blockRe = /\[PROPOSE_CANDIDATE\]\s*([\s\S]*?)\[\/PROPOSE_CANDIDATE\]/g;
+  let m: RegExpExecArray | null;
+  while ((m = blockRe.exec(text)) !== null) {
+    const body = m[1] ?? "";
+    const topic = extractField(body, "topic");
+    if (!topic) continue; // topic is required
+    const reason = extractField(body, "reason");
+    const idsRaw = extractField(body, "matched_memory_ids");
+    const matched_memory_ids = parseIdList(idsRaw);
+    signals.push({ topic, reason, matched_memory_ids });
+  }
+  return signals;
+}
+
+function extractField(body: string, field: string): string {
+  const re = new RegExp(`^${field}:\\s*(.*)$`, "m");
+  const m = body.match(re);
+  return m ? m[1]!.trim() : "";
+}
+
+function parseIdList(raw: string): string[] {
+  if (!raw || raw === "[]") return [];
+  // Accept "[m_001, m_002]" or "m_001, m_002" or "m_001"
+  const cleaned = raw.replace(/^\[/, "").replace(/\]$/, "").trim();
+  if (!cleaned) return [];
+  return cleaned.split(/[,\s]+/).filter(Boolean);
+}
+
 export class SceneExtractor {
   private dataDir: string;
   private runner: LLMRunner;
