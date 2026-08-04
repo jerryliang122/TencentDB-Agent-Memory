@@ -26,4 +26,43 @@ describe("buildSceneExtractionPrompt", () => {
     expect(result.systemPrompt).toContain("Memory Consolidation Architect");
     expect(result.userPrompt).toContain("New Memories List");
   });
+
+  it("defaults to 24h full-rewrite interval when sceneFullRewriteIntervalHours omitted", () => {
+    const result = buildSceneExtractionPrompt({
+      memoriesJson: "[]",
+      sceneSummaries: "",
+      currentTimestamp: "2026-08-04T00:00:00.000Z",
+      existingSceneFiles: [],
+      maxScenes: 15,
+    });
+    expect(result.systemPrompt).toContain("< 24 小时");
+    expect(result.systemPrompt).toContain("≥ 24 小时");
+  });
+
+  it("interpolates sceneFullRewriteIntervalHours into the UPDATE-mode rule", () => {
+    const result = buildSceneExtractionPrompt({
+      memoriesJson: "[]",
+      sceneSummaries: "",
+      currentTimestamp: "2026-08-04T00:00:00.000Z",
+      existingSceneFiles: [],
+      maxScenes: 15,
+      sceneFullRewriteIntervalHours: 48,
+    });
+    expect(result.systemPrompt).toContain("< 48 小时");
+    expect(result.systemPrompt).toContain("≥ 48 小时");
+    expect(result.systemPrompt).not.toContain("24 小时");
+  });
+
+  it("clamps invalid sceneFullRewriteIntervalHours to default 24", () => {
+    const result = buildSceneExtractionPrompt({
+      memoriesJson: "[]",
+      sceneSummaries: "",
+      currentTimestamp: "2026-08-04T00:00:00.000Z",
+      existingSceneFiles: [],
+      maxScenes: 15,
+      sceneFullRewriteIntervalHours: NaN,
+    });
+    expect(result.systemPrompt).toContain("< 24 小时");
+    expect(result.systemPrompt).toContain("≥ 24 小时");
+  });
 });
