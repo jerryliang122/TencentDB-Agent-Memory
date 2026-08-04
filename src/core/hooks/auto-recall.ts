@@ -44,7 +44,7 @@ const MEMORY_TOOLS_GUIDE = `<memory-tools-guide>
   参数：query（关键词或自然语言描述）、可选 limit/type/scene 过滤。
 - **tdai_conversation_search**：搜索原始对话（L0）。
   适用于查找具体消息原文、时间线、上下文细节；也可用于补充或校验 memory_search 的结果。
-- **read_file**（Scene Navigation 中的路径）：当已定位到相关情境、需要该场景的完整画像、事件经过或阶段结论时使用。
+- **read_file**（scene_blocks/<title>.md）：当上方 <active-scenes> 中某场景看起来相关、需要完整画像、事件经过或阶段结论时使用。按场景标题构造路径：scene_blocks/<title>.md
 
 ### ⚠️ 调用次数限制
 每轮对话中，tdai_memory_get / tdai_memory_search / tdai_conversation_search **合计最多调用 5 次**。
