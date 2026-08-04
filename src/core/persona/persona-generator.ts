@@ -1,6 +1,14 @@
 /**
  * PersonaGenerator: generates or updates user persona using the four-layer
  * deep scan model via CleanContextRunner.
+ *
+ * @deprecated As of 2026-08-04 L2/L3 redesign, persona.md auto-generation
+ * is disabled. This class is preserved for backward compatibility with
+ * seed-runtime.ts and existing checkpoint schemas, but is no longer wired
+ * into the active pipeline (see createL3Runner in pipeline-factory.ts).
+ *
+ * Replacement: L3 injection now uses top-K active scenes directly via
+ * auto-recall.ts → generateActiveScenes().
  */
 
 import fs from "node:fs/promises";
