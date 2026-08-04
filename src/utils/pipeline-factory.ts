@@ -505,12 +505,20 @@ export function createL2Runner(opts: {
       }));
     }
 
+    // Guardrail options (L2/L3 redesign) - threaded from cfg.persona so the
+    // user-configured values actually reach SceneExtractor. Wiring verified
+    // by inspection: a full pipeline test would require an LLM runner stub
+    // and VectorStore mock, which is disproportionate for a 4-line wiring fix.
     const extractor = new SceneExtractor({
       dataDir: pluginDataDir,
       config: openclawConfig!,
       model: cfg.persona.model,
       maxScenes: cfg.persona.maxScenes,
       sceneBackupCount: cfg.persona.sceneBackupCount,
+      sceneMaxChars: cfg.persona.sceneMaxChars,
+      sceneGrowthLimit: cfg.persona.sceneGrowthLimit,
+      sceneCreateThresholdMemories: cfg.persona.sceneCreateThresholdMemories,
+      sceneCreateThresholdSessions: cfg.persona.sceneCreateThresholdSessions,
       logger,
       instanceId,
       llmRunner,
