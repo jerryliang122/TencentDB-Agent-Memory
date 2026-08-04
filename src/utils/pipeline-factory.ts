@@ -575,10 +575,13 @@ export function createL2Runner(opts: {
 // ============================
 
 /**
- * Create the standard L3 runner function (persona generation).
+ * Create the L3 runner function.
  *
- * Uses PersonaTrigger to check if generation is needed, then runs
- * PersonaGenerator. Used by both `index.ts` and `seed-runtime.ts`.
+ * L3 persona generation is disabled in the L2/L3 redesign — L3 injection is
+ * now performed by `auto-recall.ts` directly reading top-K recent scenes.
+ * The runner body is a no-op that emits a debug log. PersonaGenerator and
+ * PersonaTrigger imports are retained for backward compat with seed-runtime
+ * callers and will be marked deprecated separately.
  */
 export function createL3Runner(opts: {
   pluginDataDir: string;
@@ -593,55 +596,7 @@ export function createL3Runner(opts: {
   const { pluginDataDir, cfg, openclawConfig, vectorStore, logger, instanceId, llmRunner } = opts;
 
   return async () => {
-    const trigger = new PersonaTrigger({
-      dataDir: pluginDataDir,
-      interval: cfg.persona.triggerEveryN,
-      logger,
-    });
-
-    const { should, reason } = await trigger.shouldGenerate();
-    if (!should) {
-      logger.debug?.(`${TAG} [L3] Persona generation not needed`);
-      return;
-    }
-
-    if (!openclawConfig && !llmRunner) {
-      logger.warn(`${TAG} [L3] No OpenClaw config and no LLM runner, skipping persona generation`);
-      return;
-    }
-
-    // Pull remote profiles to establish fresh baseline before generation.
-    // This ensures syncLocalProfilesToStore() has correct baselineVersion
-    // for the optimistic-lock check instead of defaulting to 0.
-    let profileBaseline = new Map<string, { version: number; contentMd5: string; createdAtMs: number }>();
-    if (vectorStore?.pullProfiles && !vectorStore.isDegraded()) {
-      profileBaseline = await pullProfilesToLocal(pluginDataDir, vectorStore, logger);
-    }
-
-    logger.info(`${TAG} [L3] Starting persona generation: ${reason}`);
-    const generator = new PersonaGenerator({
-      dataDir: pluginDataDir,
-      config: openclawConfig,
-      model: cfg.persona.model,
-      backupCount: cfg.persona.backupCount,
-      logger,
-      instanceId,
-      llmRunner,
-    });
-    const genResult = await generator.generateLocalPersona(reason);
-    if (!genResult) {
-      logger.info(`${TAG} [L3] Persona generation skipped (no changes)`);
-      return;
-    }
-
-    if (vectorStore && supportsProfileSyncWrite(vectorStore)) {
-      await syncLocalProfilesToStore(pluginDataDir, vectorStore, profileBaseline, logger);
-    }
-
-    const checkpoint = new CheckpointManager(pluginDataDir, logger);
-    const cp = await checkpoint.read();
-    await checkpoint.markPersonaGenerated(cp.total_processed);
-    logger.info(`${TAG} [L3] Persona generation succeeded`);
+    logger.debug?.(`${TAG} [L3] Persona generation disabled (L2/L3 redesign)`);
   };
 }
 

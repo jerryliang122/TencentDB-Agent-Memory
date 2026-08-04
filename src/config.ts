@@ -55,7 +55,7 @@ export interface PersonaConfig {
   backupCount: number;
   /** Scene blocks backup count (default: 10) */
   sceneBackupCount: number;
-  /** LLM model for scene extraction, format: "provider/model" */
+  /** LLM model for scene extraction (L2), format: "provider/model" (falls back to OpenClaw default model when omitted). L3 persona generation disabled in redesign. */
   model?: string;
 
   /** Max characters per scene file. Engineering-enforced (default: 2000). */
