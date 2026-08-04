@@ -455,43 +455,56 @@ export class SceneExtractor {
     //
     // Replaces the old persona-update-signal forwarding (L3 redesign disabled
     // PersonaUpdateRequest plumbing on the SceneExtractor side).
+    //
+    // Fail-soft: candidate pool errors don't fail the extraction. The LLM
+    // extraction itself succeeded; a corrupt pool or read-only / quota-exhausted
+    // data dir must not surface as a hard failure for this non-critical side path
+    // (matches Phase 5c/5d warn-and-continue semantics).
     if (llmOutput) {
-      const proposals = parseProposeCandidateSignals(llmOutput);
-      if (proposals.length > 0) {
-        const pool = await SceneCandidatePool.load(this.dataDir, this.logger);
-        for (const p of proposals) {
-          // The LLM signal does not carry per-memory session info, so we use
-          // a placeholder session key. The session threshold is therefore
-          // approximate at v1; a future tightening passes sessionKey through
-          // extract() opts.
-          const sessionKey = "unknown-session";
-          const ids = p.matched_memory_ids.length > 0
-            ? p.matched_memory_ids
-            : memories.slice(0, 1).map((m) => m.id ?? "").filter(Boolean);
-          for (const memId of ids) {
-            if (memId) pool.addObservation(p.topic, memId, sessionKey, p.reason);
+      try {
+        const proposals = parseProposeCandidateSignals(llmOutput);
+        if (proposals.length > 0) {
+          const pool = await SceneCandidatePool.load(this.dataDir, this.logger);
+          for (const p of proposals) {
+            // The LLM signal does not carry per-memory session info, so we use
+            // a placeholder session key. The session threshold is therefore
+            // approximate at v1; a future tightening passes sessionKey through
+            // extract() opts.
+            const sessionKey = "unknown-session";
+            const ids = p.matched_memory_ids.length > 0
+              ? p.matched_memory_ids
+              : memories.slice(0, 1).map((m) => m.id ?? "").filter(Boolean);
+            for (const memId of ids) {
+              if (memId) pool.addObservation(p.topic, memId, sessionKey, p.reason);
+            }
           }
-        }
-        await pool.save();
-        this.logger?.debug?.(
-          `${TAG} extract() processed ${proposals.length} PROPOSE_CANDIDATE signals`,
-        );
-
-        // Phase 8b: Promote candidates meeting thresholds. Per v1 design we
-        // only log the promotion and remove from the pool — actual scene file
-        // creation is deferred (the LLM signal will recur on future extractions
-        // and accumulate via the existing UPDATE flow once a scene exists).
-        const promotable = pool.findPromotable(
-          this.sceneCreateThresholdMemories,
-          this.sceneCreateThresholdSessions,
-        );
-        for (const candidate of promotable) {
-          this.logger?.info(
-            `${TAG} extract() candidate promoted "${candidate.topic}" (${candidate.matched_memory_ids.length} mems, ${candidate.session_keys.length} sessions) — scene creation deferred`,
+          await pool.save();
+          this.logger?.debug?.(
+            `${TAG} extract() processed ${proposals.length} PROPOSE_CANDIDATE signals`,
           );
-          pool.remove(candidate.topic);
+
+          // Phase 8b: Promote candidates meeting thresholds. Per v1 design we
+          // only log the promotion and remove from the pool — actual scene file
+          // creation is deferred (the LLM signal will recur on future extractions
+          // and accumulate via the existing UPDATE flow once a scene exists).
+          const promotable = pool.findPromotable(
+            this.sceneCreateThresholdMemories,
+            this.sceneCreateThresholdSessions,
+          );
+          for (const candidate of promotable) {
+            this.logger?.info(
+              `${TAG} extract() candidate promoted "${candidate.topic}" (${candidate.matched_memory_ids.length} mems, ${candidate.session_keys.length} sessions) — scene creation deferred`,
+            );
+            pool.remove(candidate.topic);
+          }
+          await pool.save();
         }
-        await pool.save();
+      } catch (err) {
+        this.logger?.warn?.(
+          `${TAG} extract() candidate pool error (non-fatal): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
       }
     }
 
