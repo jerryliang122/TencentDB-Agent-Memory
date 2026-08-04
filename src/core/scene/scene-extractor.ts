@@ -21,13 +21,14 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
+import crypto from "node:crypto";
 import { formatForLLM } from "../../utils/time.js";
 import { CleanContextRunner } from "../../utils/clean-context-runner.js";
 import { CheckpointManager } from "../../utils/checkpoint.js";
 import { BackupManager } from "../../utils/backup.js";
 import { readSceneIndex, syncSceneIndex } from "../scene/scene-index.js";
 import type { SceneIndexEntry } from "../scene/scene-index.js";
-import { parseSceneBlock } from "../scene/scene-format.js";
+import { parseSceneBlock, formatSceneBlock } from "../scene/scene-format.js";
 import { normalizeSceneFilenames } from "./filename-normalizer.js";
 import { enforceSceneLength, detectMergeBloat } from "./scene-guardrails.js";
 import { SceneCandidatePool } from "./scene-candidates.js";
@@ -249,13 +250,17 @@ export class SceneExtractor {
 
     // Snapshot scene index + content before LLM — used later to diff created/updated/deleted
     const preExtractIndex = new Map(index.map((e) => [e.filename, e.summary]));
-    // Also snapshot scene content so we can detect content-only changes vs metadata-only changes
+    // Also snapshot scene content so we can detect content-only changes vs metadata-only changes.
+    // Also snapshot last_full_rewrite_at so Phase 5d can backfill it if the LLM did a full
+    // rewrite (content changed) but forgot to bump the field (spec §3.2 engineering fallback).
     const preExtractContent = new Map<string, string>();
+    const preExtractRewriteAt = new Map<string, string>();
     for (const e of index) {
       try {
         const raw = await fs.readFile(path.join(sceneBlocksDir, e.filename), "utf-8");
         const block = parseSceneBlock(raw, e.filename);
         preExtractContent.set(e.filename, block.content);
+        preExtractRewriteAt.set(e.filename, block.meta.last_full_rewrite_at);
       } catch { /* non-fatal */ }
     }
 
@@ -452,6 +457,60 @@ export class SceneExtractor {
     }
     this.logger?.debug?.(
       `${TAG} extract() bloat detection: ${suspectedCount} suspected files (${Date.now() - bloatStartMs}ms)`,
+    );
+
+    // Phase 5e: Backfill last_full_rewrite_at (spec §3.2 engineering fallback).
+    //
+    // If the LLM performed a full rewrite (content hash changed) but forgot
+    // to bump `last_full_rewrite_at` (the field is unchanged from pre-extract
+    // value), the engineering layer overwrites it to `now`. This keeps the
+    // field reliable as the trigger for the 24h edit-vs-rewrite mode
+    // selection in subsequent extractions, even when the LLM is sloppy.
+    //
+    // Uses sha256 content hash comparison (not string equality) for
+    // symmetry with how the bloat detector might evolve, and because hash
+    // comparison is O(1) after the digest - the equality short-circuit
+    // inside createHash is fine but the explicit hash makes intent clear.
+    const backfillStartMs = Date.now();
+    let backfilledCount = 0;
+    try {
+      const nowIso = new Date().toISOString();
+      for (const [filename, oldContent] of preExtractContent) {
+        const filePath = path.join(sceneBlocksDir, filename);
+        let newRaw: string;
+        try {
+          newRaw = await fs.readFile(filePath, "utf-8");
+        } catch {
+          continue; // File deleted in Phase 5 - nothing to backfill.
+        }
+        const newBlock = parseSceneBlock(newRaw, filename);
+        // Skip if content is unchanged (no rewrite happened).
+        const oldHash = crypto.createHash("sha256").update(oldContent).digest("hex");
+        const newHash = crypto.createHash("sha256").update(newBlock.content).digest("hex");
+        if (oldHash === newHash) continue;
+        // Skip if LLM already updated last_full_rewrite_at (it did its job).
+        const preRewriteAt = preExtractRewriteAt.get(filename) ?? "";
+        if (newBlock.meta.last_full_rewrite_at !== preRewriteAt) continue;
+        // Content changed but field unchanged -> backfill.
+        const updatedMeta = {
+          ...newBlock.meta,
+          last_full_rewrite_at: nowIso,
+          updated: nowIso,
+        };
+        const rewritten = formatSceneBlock(updatedMeta, newBlock.content);
+        await fs.writeFile(filePath, rewritten, "utf-8");
+        backfilledCount++;
+        this.logger?.debug?.(
+          `${TAG} extract() backfilled last_full_rewrite_at for ${filename} (LLM did full rewrite but left field unchanged)`,
+        );
+      }
+    } catch (backfillErr) {
+      this.logger?.warn?.(
+        `${TAG} extract() last_full_rewrite_at backfill error: ${backfillErr instanceof Error ? backfillErr.message : String(backfillErr)}`,
+      );
+    }
+    this.logger?.debug?.(
+      `${TAG} extract() last_full_rewrite_at backfill: ${backfilledCount} files (${Date.now() - backfillStartMs}ms)`,
     );
 
     // Phase 6: Sync scene index (rebuilds from remaining non-empty files)
