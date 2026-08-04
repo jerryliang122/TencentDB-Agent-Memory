@@ -492,19 +492,58 @@ export class SceneExtractor {
             `${TAG} extract() processed ${proposals.length} PROPOSE_CANDIDATE signals`,
           );
 
-          // Phase 8b: Promote candidates meeting thresholds. Per v1 design we
-          // only log the promotion and remove from the pool — actual scene file
-          // creation is deferred (the LLM signal will recur on future extractions
-          // and accumulate via the existing UPDATE flow once a scene exists).
+          // Phase 8b: Promote candidates meeting thresholds - create stub scene
+          // files. v1 writes a stub directly (no LLM call); the next LLM
+          // extraction sees this new file in the scene list and treats it as a
+          // normal scene to UPDATE (or leaves alone if no related memories in
+          // the current batch). Over time, as new memories about the topic
+          // arrive, the LLM populates the narrative.
+          // v2 (spec §3.1 "特殊 LLM 调用"): replace stub with a dedicated LLM
+          // call over the candidate's accumulated L1 content.
           const promotable = pool.findPromotable(
             this.sceneCreateThresholdMemories,
             this.sceneCreateThresholdSessions,
           );
           for (const candidate of promotable) {
             this.logger?.info(
-              `${TAG} extract() candidate promoted "${candidate.topic}" (${candidate.matched_memory_ids.length} mems, ${candidate.session_keys.length} sessions) — scene creation deferred`,
+              `${TAG} extract() promoting candidate "${candidate.topic}" to formal scene ` +
+              `(${candidate.matched_memory_ids.length} mems, ${candidate.session_keys.length} sessions)`,
             );
-            pool.remove(candidate.topic);
+            try {
+              const stubFilename = `${sanitizeFilename(candidate.topic)}.md`;
+              const stubPath = path.join(sceneBlocksDir, stubFilename);
+              const nowIso = new Date().toISOString();
+              const stubContent = `-----META-START-----
+created: ${nowIso}
+updated: ${nowIso}
+summary: ${candidate.topic} (auto-promoted from candidate pool, pending first LLM extraction)
+heat: ${candidate.matched_memory_ids.length}
+last_full_rewrite_at: ${nowIso}
+-----META-END-----
+
+# ${candidate.topic}
+
+This scene was auto-created from the candidate pool after accumulating
+${candidate.matched_memory_ids.length} memory observations across
+${candidate.session_keys.length} sessions. Pending first LLM extraction
+to populate narrative content.
+
+## Matched Memory IDs
+${candidate.matched_memory_ids.map((id) => `- ${id}`).join("\n")}
+
+## Recent Proposals
+${candidate.recent_proposals.map((p) => `- ${p}`).join("\n")}
+`;
+              await fs.writeFile(stubPath, stubContent, "utf-8");
+              pool.remove(candidate.topic);
+              this.logger?.info(`${TAG} extract() created stub scene: ${stubFilename}`);
+            } catch (err) {
+              this.logger?.warn?.(
+                `${TAG} extract() failed to promote candidate "${candidate.topic}": ${
+                  err instanceof Error ? err.message : String(err)
+                }`,
+              );
+            }
           }
           await pool.save();
         }
@@ -623,4 +662,38 @@ export class SceneExtractor {
 
 function formatTimestamp(d: Date): string {
   return formatForLLM(d);
+}
+
+/**
+ * Sanitize a candidate topic into a filesystem-safe stem (no extension).
+ *
+ * Used by Phase 8b when promoting a candidate to a stub scene file. Mirrors
+ * the allowed-charset rules of `normalizeSceneFilename` from
+ * `filename-normalizer.ts` (Unicode letters/numbers + `-`/`_`/`.`) but
+ * operates on a topic string (which may contain spaces, slashes, brackets)
+ * rather than an existing filename.
+ *
+ * Rules:
+ *   - Whitespace runs (incl. NBSP, full-width space) -> single hyphen.
+ *   - Drop quotes, brackets, and shell/markdown-breaking punctuation.
+ *   - Collapse consecutive separators.
+ *   - Trim leading / trailing separators.
+ *   - Fall back to "scene" if the stem becomes empty.
+ *
+ * Examples:
+ *   "Rust 学习"          -> "Rust-学习"
+ *   "Daily Rhythm"       -> "Daily-Rhythm"
+ *   "Coffee (Yirgacheffe)" -> "Coffee-Yirgacheffe"
+ *   "a/b\\c"              -> "abc"  (slashes dropped, no separator injected)
+ */
+export function sanitizeFilename(topic: string): string {
+  if (!topic) return "scene";
+  const safe = topic
+    .replace(/[\s\u00A0\u3000]+/g, "-")
+    .replace(/[()[\]{}<>'"`,;:!?*|/\\=&%$#@^~+]/g, "")
+    .replace(/-{2,}/g, "-")
+    .replace(/_{2,}/g, "_")
+    .replace(/\.{2,}/g, ".")
+    .replace(/^[-_.]+|[-_.]+$/g, "");
+  return safe || "scene";
 }

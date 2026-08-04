@@ -1,5 +1,45 @@
 import { describe, it, expect } from "vitest";
-import { parseProposeCandidateSignals } from "./scene-extractor.js";
+import { parseProposeCandidateSignals, sanitizeFilename } from "./scene-extractor.js";
+
+describe("sanitizeFilename", () => {
+  it("returns 'scene' for empty input", () => {
+    expect(sanitizeFilename("")).toBe("scene");
+  });
+
+  it("returns 'scene' for whitespace-only input", () => {
+    expect(sanitizeFilename("   ")).toBe("scene");
+  });
+
+  it("replaces whitespace runs with single hyphen", () => {
+    expect(sanitizeFilename("Daily Rhythm")).toBe("Daily-Rhythm");
+    expect(sanitizeFilename("Daily   Rhythm")).toBe("Daily-Rhythm");
+  });
+
+  it("preserves CJK characters", () => {
+    expect(sanitizeFilename("Rust 学习")).toBe("Rust-学习");
+  });
+
+  it("strips brackets and punctuation", () => {
+    expect(sanitizeFilename("Coffee (Yirgacheffe)")).toBe("Coffee-Yirgacheffe");
+    expect(sanitizeFilename("Q1 Milestone?")).toBe("Q1-Milestone");
+    expect(sanitizeFilename("a/b\\c")).toBe("abc");
+  });
+
+  it("collapses consecutive separators", () => {
+    expect(sanitizeFilename("a--b")).toBe("a-b");
+    expect(sanitizeFilename("a   b")).toBe("a-b");
+  });
+
+  it("trims leading and trailing separators", () => {
+    expect(sanitizeFilename("--abc--")).toBe("abc");
+    expect(sanitizeFilename("  abc  ")).toBe("abc");
+  });
+
+  it("falls back to scene when all chars stripped", () => {
+    expect(sanitizeFilename("()[]{}")).toBe("scene");
+    expect(sanitizeFilename("???")).toBe("scene");
+  });
+});
 
 describe("parseProposeCandidateSignals", () => {
   it("parses single PROPOSE_CANDIDATE block", () => {
