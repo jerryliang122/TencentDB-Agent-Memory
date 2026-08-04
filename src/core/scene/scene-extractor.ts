@@ -12,8 +12,11 @@
  *   1. Backup + load scene index + build summaries
  *   2. Assemble extraction prompt with memories + scene context
  *   3. Run via CleanContextRunner (tools enabled, sandboxed to scene_blocks/)
- *   4. Cleanup: remove soft-deletes, sync index, update navigation
- *   5. Parse LLM text output for out-of-band persona update signals
+ *   4. Cleanup: remove soft-deletes, sync index
+ *   5. Parse LLM text output for [PROPOSE_CANDIDATE] signals and update
+ *      the SceneCandidatePool; promote candidates meeting thresholds.
+ *   6. Engineering guardrails: hard-truncate oversized scene files (5c)
+ *      and detect (log-only) suspected merge-bloat (5d).
  */
 
 import fs from "node:fs/promises";
@@ -25,8 +28,9 @@ import { BackupManager } from "../../utils/backup.js";
 import { readSceneIndex, syncSceneIndex } from "../scene/scene-index.js";
 import type { SceneIndexEntry } from "../scene/scene-index.js";
 import { parseSceneBlock } from "../scene/scene-format.js";
-import { generateSceneNavigation, stripSceneNavigation } from "../scene/scene-navigation.js";
 import { normalizeSceneFilenames } from "./filename-normalizer.js";
+import { enforceSceneLength, detectMergeBloat } from "./scene-guardrails.js";
+import { SceneCandidatePool } from "./scene-candidates.js";
 import { buildSceneExtractionPrompt } from "../prompts/scene-extraction.js";
 import { report } from "../report/reporter.js";
 import type { LLMRunner, Logger } from "../types.js";
@@ -57,6 +61,16 @@ export interface SceneExtractorOptions {
    * Must be configured with `enableTools: true`.
    */
   llmRunner?: LLMRunner;
+
+  // ── New (L2/L3 redesign) ──
+  /** Hard char limit per scene file (default 2000). */
+  sceneMaxChars?: number;
+  /** UPDATE length growth ratio limit (default 1.5). */
+  sceneGrowthLimit?: number;
+  /** Candidate pool: memory count threshold (default 5). */
+  sceneCreateThresholdMemories?: number;
+  /** Candidate pool: session count threshold (default 3). */
+  sceneCreateThresholdSessions?: number;
 }
 
 /**
@@ -65,6 +79,10 @@ export interface SceneExtractorOptions {
  * Supports multiple formats for robustness:
  * - Block: [PERSONA_UPDATE_REQUEST]reason: xxx[/PERSONA_UPDATE_REQUEST]
  * - Inline: PERSONA_UPDATE_REQUEST: xxx
+ *
+ * @deprecated L2/L3 redesign (Task 10) disabled persona-update-signal
+ *   forwarding. SceneExtractor no longer calls this function. Retained
+ *   for backward compatibility with older logs and external consumers.
  */
 export function parsePersonaUpdateSignal(text: string): { reason: string } | null {
   // Block format: [PERSONA_UPDATE_REQUEST]...[/PERSONA_UPDATE_REQUEST]
@@ -139,6 +157,11 @@ export class SceneExtractor {
   private timeoutMs: number;
   private logger: ExtractorLogger | undefined;
   private instanceId: string | undefined;
+  // L2/L3 redesign guardrail knobs (Task 10)
+  private sceneMaxChars: number;
+  private sceneGrowthLimit: number;
+  private sceneCreateThresholdMemories: number;
+  private sceneCreateThresholdSessions: number;
 
   constructor(opts: SceneExtractorOptions) {
     this.dataDir = opts.dataDir;
@@ -147,6 +170,10 @@ export class SceneExtractor {
     this.timeoutMs = opts.timeoutMs ?? 300_000; // 5 min — LLM may do multiple tool calls
     this.logger = opts.logger;
     this.instanceId = opts.instanceId;
+    this.sceneMaxChars = opts.sceneMaxChars ?? 2000;
+    this.sceneGrowthLimit = opts.sceneGrowthLimit ?? 1.5;
+    this.sceneCreateThresholdMemories = opts.sceneCreateThresholdMemories ?? 5;
+    this.sceneCreateThresholdSessions = opts.sceneCreateThresholdSessions ?? 3;
 
     // Use injected LLMRunner if available, otherwise fall back to CleanContextRunner
     this.runner = opts.llmRunner ?? new CleanContextRunner({
@@ -353,27 +380,118 @@ export class SceneExtractor {
       this.logger?.warn(`${TAG} extract() filename normalization error: ${normErr instanceof Error ? normErr.message : String(normErr)}`);
     }
 
+    // Phase 5c: Length enforcement — hard truncation of over-limit scene files.
+    // Defensive: LLM may ignore prompt-level length guidance; this guarantees
+    // an absolute upper bound on each scene file's char count.
+    const lenStartMs = Date.now();
+    let truncatedCount = 0;
+    try {
+      const allFiles = (await fs.readdir(sceneBlocksDir)).filter((f) => f.endsWith(".md"));
+      for (const file of allFiles) {
+        const filePath = path.join(sceneBlocksDir, file);
+        const raw = await fs.readFile(filePath, "utf-8");
+        const result = enforceSceneLength(raw, this.sceneMaxChars);
+        if (result.truncated) {
+          await fs.writeFile(filePath, result.output, "utf-8");
+          truncatedCount++;
+          this.logger?.warn(
+            `${TAG} extract() truncated ${file}: ${result.originalLength} → ${result.output.length} chars`,
+          );
+        }
+      }
+    } catch (lenErr) {
+      this.logger?.warn?.(
+        `${TAG} extract() length enforcement error: ${lenErr instanceof Error ? lenErr.message : String(lenErr)}`,
+      );
+    }
+    this.logger?.debug?.(
+      `${TAG} extract() length enforcement: truncated ${truncatedCount} files (${Date.now() - lenStartMs}ms)`,
+    );
+
+    // Phase 5d: Merge bloat detection — detect (log-only) scenes suspected of
+    // pure-append bloat. Actual rollback is deferred: BackupManager only
+    // supports `restoreLatestDirectory` (whole scene_blocks/), not per-file
+    // restore, so a single bloated file cannot be surgically reverted without
+    // clobbering legitimate concurrent writes to other files.
+    const bloatStartMs = Date.now();
+    let suspectedCount = 0;
+    try {
+      for (const [filename, oldContent] of preExtractContent) {
+        const filePath = path.join(sceneBlocksDir, filename);
+        let newRaw: string;
+        try {
+          newRaw = await fs.readFile(filePath, "utf-8");
+        } catch {
+          continue; // File deleted in Phase 5 — nothing to compare.
+        }
+        const newBlock = parseSceneBlock(newRaw, filename);
+        const detection = detectMergeBloat(oldContent, newBlock.content, this.sceneGrowthLimit);
+        if (detection.suspected) {
+          suspectedCount++;
+          this.logger?.warn(
+            `${TAG} extract() merge bloat suspected for ${filename}: ${detection.reason} — manual review needed`,
+          );
+          // TODO(v2): single-file restore requires BackupManager.restoreLatestFile
+          // (not yet implemented). When available, restore this file from the
+          // Phase 1 backup instead of just warning.
+        }
+      }
+    } catch (bloatErr) {
+      this.logger?.warn?.(
+        `${TAG} extract() bloat detection error: ${bloatErr instanceof Error ? bloatErr.message : String(bloatErr)}`,
+      );
+    }
+    this.logger?.debug?.(
+      `${TAG} extract() bloat detection: ${suspectedCount} suspected files (${Date.now() - bloatStartMs}ms)`,
+    );
+
     // Phase 6: Sync scene index (rebuilds from remaining non-empty files)
     const syncStartMs = Date.now();
     await syncSceneIndex(this.dataDir);
     this.logger?.debug?.(`${TAG} extract() scene index synced: ${Date.now() - syncStartMs}ms`);
 
-    // Phase 7: Update persona.md navigation (GAP-4 fix)
-    const navStartMs = Date.now();
-    try {
-      await this.updateSceneNavigation();
-      this.logger?.debug?.(`${TAG} extract() persona.md navigation updated: ${Date.now() - navStartMs}ms`);
-    } catch (navErr) {
-      // Non-fatal — log and continue
-      this.logger?.warn(`${TAG} extract() failed to update persona navigation: ${navErr instanceof Error ? navErr.message : String(navErr)}`);
-    }
-
-    // Phase 8: Parse LLM output for out-of-band persona update signal
+    // Phase 8: Parse LLM output for PROPOSE_CANDIDATE signals and update
+    // the SceneCandidatePool; promote candidates meeting thresholds.
+    //
+    // Replaces the old persona-update-signal forwarding (L3 redesign disabled
+    // PersonaUpdateRequest plumbing on the SceneExtractor side).
     if (llmOutput) {
-      const signal = parsePersonaUpdateSignal(llmOutput);
-      if (signal) {
-        await cpManager.setPersonaUpdateRequest(signal.reason);
-        this.logger?.debug?.(`${TAG} extract() persona update requested by LLM: ${signal.reason}`);
+      const proposals = parseProposeCandidateSignals(llmOutput);
+      if (proposals.length > 0) {
+        const pool = await SceneCandidatePool.load(this.dataDir, this.logger);
+        for (const p of proposals) {
+          // The LLM signal does not carry per-memory session info, so we use
+          // a placeholder session key. The session threshold is therefore
+          // approximate at v1; a future tightening passes sessionKey through
+          // extract() opts.
+          const sessionKey = "unknown-session";
+          const ids = p.matched_memory_ids.length > 0
+            ? p.matched_memory_ids
+            : memories.slice(0, 1).map((m) => m.id ?? "").filter(Boolean);
+          for (const memId of ids) {
+            if (memId) pool.addObservation(p.topic, memId, sessionKey, p.reason);
+          }
+        }
+        await pool.save();
+        this.logger?.debug?.(
+          `${TAG} extract() processed ${proposals.length} PROPOSE_CANDIDATE signals`,
+        );
+
+        // Phase 8b: Promote candidates meeting thresholds. Per v1 design we
+        // only log the promotion and remove from the pool — actual scene file
+        // creation is deferred (the LLM signal will recur on future extractions
+        // and accumulate via the existing UPDATE flow once a scene exists).
+        const promotable = pool.findPromotable(
+          this.sceneCreateThresholdMemories,
+          this.sceneCreateThresholdSessions,
+        );
+        for (const candidate of promotable) {
+          this.logger?.info(
+            `${TAG} extract() candidate promoted "${candidate.topic}" (${candidate.matched_memory_ids.length} mems, ${candidate.session_keys.length} sessions) — scene creation deferred`,
+          );
+          pool.remove(candidate.topic);
+        }
+        await pool.save();
       }
     }
 
@@ -478,49 +596,6 @@ export class SceneExtractor {
       lines.push("");
     }
     return { summaries: lines.join("\n"), filenames };
-  }
-
-  /**
-   * Update the scene navigation section at the end of persona.md.
-   *
-   * Reads the current scene index, generates the navigation block, then
-   * strips any existing navigation from persona.md and appends the new one.
-   *
-   * IMPORTANT: If the persona body is empty (PersonaGenerator hasn't run yet),
-   * we skip writing to avoid creating a persona.md that only contains the
-   * scene navigation. PersonaGenerator.generate() will write the full
-   * persona + navigation when it runs.
-   */
-  private async updateSceneNavigation(): Promise<void> {
-    const personaPath = path.join(this.dataDir, "persona.md");
-    const index = await readSceneIndex(this.dataDir);
-    const nav = generateSceneNavigation(index);
-
-    let existing = "";
-    try {
-      existing = await fs.readFile(personaPath, "utf-8");
-    } catch {
-      // No persona file yet — PersonaGenerator will create it with navigation.
-      // Don't write a navigation-only file.
-      this.logger?.debug?.(`${TAG} updateSceneNavigation() skipped: no persona file yet, waiting for PersonaGenerator`);
-      return;
-    }
-
-    if (!existing.trim() && !nav) return;
-
-    const stripped = stripSceneNavigation(existing).trimEnd();
-
-    // If the persona body is empty (only navigation existed), don't overwrite
-    // with a navigation-only file. Let PersonaGenerator handle full generation.
-    if (!stripped) {
-      this.logger?.debug?.(`${TAG} updateSceneNavigation() skipped: persona body is empty, waiting for PersonaGenerator`);
-      return;
-    }
-
-    const updated = nav ? `${stripped}\n\n${nav}\n` : `${stripped}\n`;
-
-    // persona.md is at dataDir root, no subdir needed
-    await fs.writeFile(personaPath, updated, "utf-8");
   }
 }
 
