@@ -1,21 +1,18 @@
 /**
- * auto-recall hook (v3): injects relevant memories + persona into agent context
+ * auto-recall hook (v3): injects relevant memories + active scenes into agent context
  * before the agent starts processing.
  *
  * - Searches L1 memories using configurable strategy (keyword / embedding / hybrid)
  *   - keyword: FTS5 BM25 (requires FTS5; returns empty if unavailable)
  *   - embedding: VectorStore cosine similarity
  *   - hybrid: keyword + embedding merged with RRF
- * - L3 persona injection
- * - L2 scene navigation (full injection, LLM decides relevance)
+ * - L3 active scenes (top-K most-recently-updated summaries)
  */
 
-import fs from "node:fs/promises";
-import path from "node:path";
 import { formatForLLM } from "../../utils/time.js";
 import type { MemoryTdaiConfig } from "../../config.js";
 import { readSceneIndex } from "../scene/scene-index.js";
-import { generateSceneNavigation, stripSceneNavigation } from "../scene/scene-navigation.js";
+import { generateActiveScenes } from "../scene/scene-navigation.js";
 import type { MemoryRecord } from "../record/l1-reader.js";
 import type { IMemoryStore, L1SearchResult, L1FtsResult } from "../store/types.js";
 import { buildFtsQuery } from "../store/sqlite.js";
@@ -66,13 +63,14 @@ export interface RecalledMemory {
 export interface RecallResult {
   /** L1 relevant memories — prepended to user prompt text (dynamic, per-turn) */
   prependContext?: string;
-  /** Stable recall context appended to system prompt (persona, scene nav, tools guide — cacheable) */
+  /** Stable recall context appended to system prompt (active scenes, tools guide — cacheable) */
   appendSystemContext?: string;
 
   // ── Metric payload (for pendingRecallCache in index.ts) ──
   /** L1 memories that were recalled (with scores), for metric reporting */
   recalledL1Memories?: RecalledMemory[];
-  /** L3 Persona raw content loaded during recall (null if none) */
+  /** @deprecated L3 persona injection removed in redesign; always null. Field
+   *  retained for backward-compat with metric consumers in index.ts. */
   recalledL3Persona?: string | null;
   /** Effective search strategy used */
   recallStrategy?: string;
@@ -128,7 +126,7 @@ async function performAutoRecallInner(params: {
   let recalledL1Memories: RecalledMemory[] = [];
   let searchTiming: SearchTiming = { ftsMs: 0, embeddingMs: 0, ftsHits: 0, embeddingHits: 0 };
   if (!userText || userText.length === 0) {
-    logger?.debug?.(`${TAG} User text empty/undefined, skipping memory search (persona/scene still injected)`);
+    logger?.debug?.(`${TAG} User text empty/undefined, skipping memory search (scenes still injected)`);
   } else {
     effectiveStrategy = cfg.recall.strategy ?? "hybrid";
     const searchResult = await searchMemories(userText, pluginDataDir, cfg, logger, effectiveStrategy as "keyword" | "embedding" | "hybrid", vectorStore, embeddingService);
@@ -150,52 +148,48 @@ async function performAutoRecallInner(params: {
   }
   const tSearchEnd = performance.now();
 
-  // Read persona (L3 layer)
+  // L3 persona injection removed in redesign — persona.md auto-generation
+  // is disabled. User profile is owned by AGENTS.md / IDENTITY.md / USER.md.
   const tPersonaStart = performance.now();
-  let personaContent: string | undefined;
-  try {
-    const personaPath = path.join(pluginDataDir, "persona.md");
-    const raw = await fs.readFile(personaPath, "utf-8");
-    personaContent = stripSceneNavigation(raw).trim();
-    if (!personaContent) personaContent = undefined;
-    logger?.debug?.(`${TAG} Persona loaded: ${personaContent ? `${personaContent.length} chars` : "empty"}`);
-  } catch {
-    logger?.debug?.(`${TAG} No persona file found (expected for new users)`);
-  }
-  const tPersonaEnd = performance.now();
+  const tPersonaEnd = tPersonaStart;
 
-  // Load full scene navigation (L2 layer)
+  // Load top-K active scenes (L2/L3 layer — recent activity context)
   const tSceneStart = performance.now();
-  let sceneNavigation: string | undefined;
+  let activeScenesText: string | undefined;
   try {
     const sceneIndex = await readSceneIndex(pluginDataDir);
     if (sceneIndex.length > 0) {
-      sceneNavigation = generateSceneNavigation(sceneIndex, pluginDataDir);
-      logger?.debug?.(`${TAG} Scene navigation generated: ${sceneIndex.length} scenes`);
+      activeScenesText = generateActiveScenes(
+        sceneIndex,
+        cfg.persona.l3InjectTopK,
+        cfg.persona.l3InjectSummaryChars,
+      );
+      logger?.debug?.(
+        `${TAG} Active scenes generated: top-${cfg.persona.l3InjectTopK} of ${sceneIndex.length}`,
+      );
     }
   } catch {
     logger?.debug?.(`${TAG} No scene index found`);
   }
   const tSceneEnd = performance.now();
 
-  if (memoryLines.length === 0 && !personaContent && !sceneNavigation) {
+  if (memoryLines.length === 0 && !activeScenesText) {
     const totalMs = performance.now() - tRecallStart;
     logger?.info(
       `${TAG} ⏱ Recall timing: total=${totalMs.toFixed(0)}ms, ` +
       `search=${(tSearchEnd - tSearchStart).toFixed(0)}ms(strategy=${effectiveStrategy},hits=${memoryLines.length},` +
       `fts=${searchTiming.ftsMs.toFixed(0)}ms/${searchTiming.ftsHits}hits,` +
       `vec=${searchTiming.embeddingMs.toFixed(0)}ms/${searchTiming.embeddingHits}hits), ` +
-      `persona=${(tPersonaEnd - tPersonaStart).toFixed(0)}ms, ` +
       `scene=${(tSceneEnd - tSceneStart).toFixed(0)}ms — no context to inject`,
     );
-    logger?.debug?.(`${TAG} No memories/persona/scenes to inject`);
+    logger?.debug?.(`${TAG} No memories/scenes to inject`);
     return undefined;
   }
 
   // Split recall context into stable and dynamic parts to optimize prompt caching.
   //
   // appendSystemContext (system prompt end — stable, cacheable):
-  //   persona, scene navigation, memory tools guide
+  //   active scenes, memory tools guide
   //   These change infrequently; when content is identical across turns,
   //   providers with prompt caching (Anthropic/OpenAI) can cache this region.
   //
@@ -203,11 +197,8 @@ async function performAutoRecallInner(params: {
   //   L1 relevant memories — different every turn, moved out of system prompt
   //   so it doesn't bust the system prompt cache.
   const stableParts: string[] = [];
-  if (personaContent) {
-    stableParts.push(`<user-persona>\n${personaContent}\n</user-persona>`);
-  }
-  if (sceneNavigation) {
-    stableParts.push(`<scene-navigation>\n${sceneNavigation}\n</scene-navigation>`);
+  if (activeScenesText) {
+    stableParts.push(`<active-scenes>\n${activeScenesText}\n</active-scenes>`);
   }
 
   // Dynamic part: L1 relevant memories (changes every turn) → prependContext (user prompt)
@@ -232,8 +223,7 @@ async function performAutoRecallInner(params: {
     `search=${(tSearchEnd - tSearchStart).toFixed(0)}ms(strategy=${effectiveStrategy},hits=${memoryLines.length},` +
     `fts=${searchTiming.ftsMs.toFixed(0)}ms/${searchTiming.ftsHits}hits,` +
     `vec=${searchTiming.embeddingMs.toFixed(0)}ms/${searchTiming.embeddingHits}hits), ` +
-    `persona=${(tPersonaEnd - tPersonaStart).toFixed(0)}ms(${personaContent ? `${personaContent.length}chars` : "none"}), ` +
-    `scene=${(tSceneEnd - tSceneStart).toFixed(0)}ms(${sceneNavigation ? "loaded" : "none"})`,
+    `scene=${(tSceneEnd - tSceneStart).toFixed(0)}ms(${activeScenesText ? "loaded" : "none"})`,
   );
 
   if (!appendSystemContext && !prependContext) {
@@ -244,7 +234,7 @@ async function performAutoRecallInner(params: {
     prependContext,
     appendSystemContext,
     recalledL1Memories,
-    recalledL3Persona: personaContent ?? null,
+    recalledL3Persona: null, // L3 persona disabled in redesign
     recallStrategy: effectiveStrategy,
   };
 }
