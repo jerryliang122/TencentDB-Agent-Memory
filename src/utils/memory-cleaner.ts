@@ -16,6 +16,8 @@ export interface MemoryCleanerOptions {
   vectorStore?: IMemoryStore;
   /** L2 scene blocks TTL in days. 0 = skip scene cleanup. Default: 30 */
   sceneTtlDays?: number;
+  /** Scene candidate pool TTL in days. 0 = skip candidate cleanup. Default: 30 */
+  sceneCandidateTtlDays?: number;
 }
 
 interface CleanupStats {
@@ -194,6 +196,12 @@ export class LocalMemoryCleaner {
       await this.cleanupSceneBlocks(sceneTtlDays, nowMs);
     }
 
+    // ── Scene candidate pool TTL cleanup ──
+    const candidateTtlDays = this.opts.sceneCandidateTtlDays ?? 30;
+    if (candidateTtlDays > 0) {
+      await this.cleanupCandidatePool(candidateTtlDays);
+    }
+
   }
 
   private scheduleNext(): void {
@@ -359,6 +367,40 @@ export class LocalMemoryCleaner {
     } catch (err) {
       this.opts.logger?.warn?.(
         `${TAG} L2 cleanup: scene index sync failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * Prune expired entries from the scene candidate pool.
+   *
+   * Candidates that haven't been observed (no new PROPOSE_CANDIDATE signal)
+   * for `ttlDays` are removed from `.metadata/scene_candidates.json` so dead
+   * topics don't accumulate forever. The pool file is rewritten only when at
+   * least one entry was pruned (avoids touching the file on every tick when
+   * nothing changed).
+   *
+   * Fail-soft: errors are logged but do not abort the cleaner tick - a
+   * missing/corrupted pool file or read-only data dir must not surface as a
+   * hard failure for this non-critical side path (matches cleanupSceneBlocks
+   * semantics).
+   */
+  private async cleanupCandidatePool(ttlDays: number): Promise<void> {
+    try {
+      const { SceneCandidatePool } = await import("../core/scene/scene-candidates.js");
+      const pool = await SceneCandidatePool.load(this.opts.baseDir, this.opts.logger);
+      const expired = pool.pruneExpired(ttlDays);
+      if (expired.length > 0) {
+        await pool.save();
+        this.opts.logger?.info?.(
+          `${TAG} candidate pool cleanup: pruned ${expired.length} expired candidates (retention=${ttlDays}d)`,
+        );
+      }
+    } catch (err) {
+      this.opts.logger?.warn?.(
+        `${TAG} candidate pool cleanup error (non-fatal): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
