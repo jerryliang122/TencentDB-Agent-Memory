@@ -1,6 +1,13 @@
 /**
  * PersonaTrigger: determines whether to trigger persona generation.
  * Implements the 5 trigger conditions from the legacy system.
+ *
+ * @deprecated As of 2026-08-04 L2/L3 redesign, persona.md auto-generation
+ * is disabled. This class is preserved for backward compatibility with
+ * seed-runtime.ts and existing checkpoint schemas, but is no longer wired
+ * into the active pipeline (see createL3Runner in pipeline-factory.ts).
+ *
+ * Triggering is moot since generation is disabled.
  */
 
 import fs from "node:fs/promises";
