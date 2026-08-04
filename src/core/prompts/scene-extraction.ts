@@ -224,11 +224,10 @@ export function buildSceneExtractionPrompt(params: SceneExtractionPromptParams):
     maxScenes,
   } = params;
 
-  // sceneCountWarning is retained for backward compat — the engineering layer
-  // (Task 10 onwards) no longer populates it, but older callers still may.
-  const warningSection = sceneCountWarning
-    ? `\n⚠️ **场景数量警告**: ${sceneCountWarning}\n`
-    : "";
+  // sceneCountWarning is @deprecated — engineering layer auto-manages scene count
+  // (TTL cleanup, candidate pool promotion). Always render empty to avoid
+  // contradicting the UPDATE-only contract in systemPrompt.
+  const warningSection = "";
 
   const fileListSection = existingSceneFiles && existingSceneFiles.length > 0
     ? `### 📁 已有场景文件清单（仅以下文件可 read）\n${existingSceneFiles.map((f) => `- \`${f}\``).join("\n")}\n`
