@@ -537,7 +537,7 @@ export function createL2Runner(opts: {
     const preMemoriesSince = preState.memories_since_last_persona;
     const preTotalProcessed = preState.total_processed;
 
-    const extractResult = await extractor.extract(memories);
+    const extractResult = await extractor.extract(memories, sessionKey);
     if (extractResult.success && extractResult.memoriesProcessed > 0) {
       const checkpoint = new CheckpointManager(pluginDataDir, logger);
       const postState = await checkpoint.read();

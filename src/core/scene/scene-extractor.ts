@@ -201,7 +201,10 @@ export class SceneExtractor {
    * @param memories - Array of raw memory records from the API
    * @returns Extraction result with count and success flag
    */
-  async extract(memories: Array<{ content: string; created_at: string; id?: string }>): Promise<ExtractionResult> {
+  async extract(
+    memories: Array<{ content: string; created_at: string; id?: string }>,
+    sessionKey?: string,
+  ): Promise<ExtractionResult> {
     const extractStartMs = Date.now();
     this.logger?.info(`${TAG} extract() start: ${memories.length} memories`);
 
@@ -534,11 +537,6 @@ export class SceneExtractor {
         if (proposals.length > 0) {
           const pool = await SceneCandidatePool.load(this.dataDir, this.logger);
           for (const p of proposals) {
-            // The LLM signal does not carry per-memory session info, so we use
-            // a placeholder session key. The session threshold is therefore
-            // approximate at v1; a future tightening passes sessionKey through
-            // extract() opts.
-            const sessionKey = "unknown-session";
             const ids = p.matched_memory_ids.length > 0
               ? p.matched_memory_ids
               : memories.slice(0, 1).map((m) => m.id ?? "").filter(Boolean);
