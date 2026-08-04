@@ -7,6 +7,8 @@ export interface SceneBlockMeta {
   updated: string;
   summary: string;
   heat: number;
+  /** ISO timestamp of the last full rewrite. Empty for legacy files. */
+  last_full_rewrite_at: string;
 }
 
 export interface SceneBlock {
@@ -29,7 +31,7 @@ export function parseSceneBlock(raw: string, filename: string): SceneBlock {
     // No META section — treat entire file as content
     return {
       filename,
-      meta: { created: "", updated: "", summary: "", heat: 0 },
+      meta: { created: "", updated: "", summary: "", heat: 0, last_full_rewrite_at: "" },
       content: raw.trim(),
     };
   }
@@ -42,6 +44,7 @@ export function parseSceneBlock(raw: string, filename: string): SceneBlock {
     updated: extractMetaField(metaBlock, "updated"),
     summary: extractMetaField(metaBlock, "summary"),
     heat: parseInt(extractMetaField(metaBlock, "heat"), 10) || 0,
+    last_full_rewrite_at: extractMetaField(metaBlock, "last_full_rewrite_at"),
   };
 
   return { filename, meta, content };
@@ -64,6 +67,7 @@ export function formatMeta(meta: SceneBlockMeta): string {
     `updated: ${meta.updated}`,
     `summary: ${meta.summary}`,
     `heat: ${meta.heat}`,
+    `last_full_rewrite_at: ${meta.last_full_rewrite_at}`,
     META_END,
   ].join("\n");
 }
