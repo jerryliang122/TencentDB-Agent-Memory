@@ -145,3 +145,101 @@ describe("LocalMemoryCleaner - candidate pool cleanup", () => {
     await expect(fs.stat(path.join(tmpDir, ".metadata", "scene_candidates.json"))).rejects.toThrow();
   });
 });
+
+describe("LocalMemoryCleaner - scene blocks TTL cleanup", () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "tdai-cleaner-scene-"));
+    await fs.mkdir(path.join(tmpDir, "scene_blocks"), { recursive: true });
+  });
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("preserves scene files with unparseable META.updated timestamp", async () => {
+    // Scene with valid updated (old, past TTL)
+    await fs.writeFile(
+      path.join(tmpDir, "scene_blocks", "OldScene.md"),
+      `-----META-START-----
+created: 2020-01-01T00:00:00.000Z
+updated: 2020-01-01T00:00:00.000Z
+summary: old scene
+heat: 0
+last_full_rewrite_at: 2020-01-01T00:00:00.000Z
+-----META-END-----
+
+# Old Scene
+content`,
+      "utf-8",
+    );
+
+    // Scene with unparseable updated (empty string)
+    await fs.writeFile(
+      path.join(tmpDir, "scene_blocks", "NoUpdated.md"),
+      `-----META-START-----
+created: 2026-08-01T00:00:00.000Z
+updated:
+summary: no updated timestamp
+heat: 5
+last_full_rewrite_at:
+-----META-END-----
+
+# No Updated
+content`,
+      "utf-8",
+    );
+
+    // Scene with recent updated (within TTL)
+    await fs.writeFile(
+      path.join(tmpDir, "scene_blocks", "RecentScene.md"),
+      `-----META-START-----
+created: 2026-08-01T00:00:00.000Z
+updated: 2026-08-03T00:00:00.000Z
+summary: recent scene
+heat: 10
+last_full_rewrite_at: 2026-08-03T00:00:00.000Z
+-----META-END-----
+
+# Recent Scene
+content`,
+      "utf-8",
+    );
+
+    // Scene with high heat (within TTL) — ensures OldScene is outside top-3
+    await fs.writeFile(
+      path.join(tmpDir, "scene_blocks", "HighHeatScene.md"),
+      `-----META-START-----
+created: 2026-08-01T00:00:00.000Z
+updated: 2026-08-03T00:00:00.000Z
+summary: high heat scene
+heat: 20
+last_full_rewrite_at: 2026-08-03T00:00:00.000Z
+-----META-END-----
+
+# High Heat Scene
+content`,
+      "utf-8",
+    );
+
+    const cleaner = new LocalMemoryCleaner({
+      baseDir: tmpDir,
+      retentionDays: 7,
+      cleanTime: "03:00",
+      sceneTtlDays: 7, // 7-day TTL
+      sceneCandidateTtlDays: 0,
+    });
+
+    await cleaner.runOnce(Date.parse("2026-08-04T03:00:00.000Z"));
+
+    // OldScene: past TTL, heat=1 (not top-3) → should be deleted
+    await expect(fs.stat(path.join(tmpDir, "scene_blocks", "OldScene.md"))).rejects.toThrow();
+
+    // NoUpdated: unparseable timestamp → should be preserved (not deleted)
+    await expect(fs.stat(path.join(tmpDir, "scene_blocks", "NoUpdated.md"))).resolves.toBeDefined();
+
+    // RecentScene: within TTL, heat=10 → should be preserved
+    await expect(fs.stat(path.join(tmpDir, "scene_blocks", "RecentScene.md"))).resolves.toBeDefined();
+  });
+});

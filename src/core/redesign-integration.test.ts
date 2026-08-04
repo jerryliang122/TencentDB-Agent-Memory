@@ -63,4 +63,25 @@ matched_memory_ids: [m_1, m_2, m_3, m_4, m_5]
     expect(activeText).not.toContain("A".repeat(60));
     expect(activeText).toContain("…");
   });
+
+  it("sessionKey threading: addObservation uses distinct session keys for promotion threshold", async () => {
+    const pool = await SceneCandidatePool.load(tmpDir);
+
+    // Same topic observed across 3 different sessions (each with 1 memory)
+    pool.addObservation("CrossSessionTopic", "m_1", "session-a", "first");
+    pool.addObservation("CrossSessionTopic", "m_2", "session-b", "second");
+    pool.addObservation("CrossSessionTopic", "m_3", "session-c", "third");
+
+    // Memory threshold (5) not met, but session threshold (3) is
+    const bySessions = pool.findPromotable(10, 3);
+    expect(bySessions.map((c) => c.topic)).toEqual(["CrossSessionTopic"]);
+
+    // Same topic in a single session, 5 memories — session threshold not met
+    const singleSessionTopic = "SingleSessionTopic";
+    for (let i = 0; i < 5; i++) {
+      pool.addObservation(singleSessionTopic, `m_${i + 10}`, "session-z", `obs-${i}`);
+    }
+    const byMemories = pool.findPromotable(5, 10);
+    expect(byMemories.map((c) => c.topic)).toEqual(["SingleSessionTopic"]);
+  });
 });
