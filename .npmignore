@@ -20,3 +20,6 @@ workspace/
 # 运行时产物
 node_modules/
 *.tgz
+
+# L2/L3 redesign migration script (one-time, not published)
+scripts/migrate-l2-compress.*
