@@ -47,16 +47,35 @@ export interface ExtractionConfig {
 
 /** Persona (L2/L3) settings — controls scene extraction (L2) and user profile generation (L3). */
 export interface PersonaConfig {
-  /** Trigger persona generation every N new memories (default: 50) */
+  /** @deprecated L3 persona generation disabled in redesign. Field kept for backward compat. */
   triggerEveryN: number;
-  /** Max scene blocks (default: 15) */
+  /** Max scene blocks (default: 15) — used as warning threshold only */
   maxScenes: number;
-  /** Persona backup count (default: 3) */
+  /** @deprecated Persona backup count (persona generation disabled). */
   backupCount: number;
   /** Scene blocks backup count (default: 10) */
   sceneBackupCount: number;
-  /** LLM model for persona generation, format: "provider/model" (falls back to OpenClaw default model when omitted) */
+  /** LLM model for scene extraction, format: "provider/model" */
   model?: string;
+
+  /** Max characters per scene file. Engineering-enforced (default: 2000). */
+  sceneMaxChars: number;
+  /** Single-UPDATE length growth ratio limit (default: 1.5). */
+  sceneGrowthLimit: number;
+  /** Full rewrite interval in hours. UPDATEs beyond this must use write, not edit (default: 24). */
+  sceneFullRewriteIntervalHours: number;
+  /** Scene TTL in days. Scenes not updated for this long are deleted (default: 30, 0=disabled). */
+  sceneTtlDays: number;
+  /** Candidate pool: memory count threshold for promotion (default: 5). */
+  sceneCreateThresholdMemories: number;
+  /** Candidate pool: distinct session count threshold for promotion (default: 3). */
+  sceneCreateThresholdSessions: number;
+  /** Candidate pool TTL in days (default: 30). */
+  sceneCandidateTtlDays: number;
+  /** L3 injection: how many top-recent scenes to inject into system prompt (default: 5). */
+  l3InjectTopK: number;
+  /** L3 injection: max summary chars per scene (default: 150). */
+  l3InjectSummaryChars: number;
 }
 
 /** Pipeline trigger settings (L1→L2→L3 scheduling). */
@@ -543,6 +562,15 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       backupCount: num(personaGroup, "backupCount") ?? 3,
       sceneBackupCount: num(personaGroup, "sceneBackupCount") ?? 10,
       model: optStr(personaGroup, "model"),
+      sceneMaxChars: num(personaGroup, "sceneMaxChars") ?? 2000,
+      sceneGrowthLimit: num(personaGroup, "sceneGrowthLimit") ?? 1.5,
+      sceneFullRewriteIntervalHours: num(personaGroup, "sceneFullRewriteIntervalHours") ?? 24,
+      sceneTtlDays: num(personaGroup, "sceneTtlDays") ?? 30,
+      sceneCreateThresholdMemories: num(personaGroup, "sceneCreateThresholdMemories") ?? 5,
+      sceneCreateThresholdSessions: num(personaGroup, "sceneCreateThresholdSessions") ?? 3,
+      sceneCandidateTtlDays: num(personaGroup, "sceneCandidateTtlDays") ?? 30,
+      l3InjectTopK: num(personaGroup, "l3InjectTopK") ?? 5,
+      l3InjectSummaryChars: num(personaGroup, "l3InjectSummaryChars") ?? 150,
     },
     pipeline: {
       everyNConversations: num(pipelineGroup, "everyNConversations") ?? 5,
