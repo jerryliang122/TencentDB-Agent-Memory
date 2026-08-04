@@ -2,6 +2,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import type { IMemoryStore } from "../core/store/types.js";
+import { parseSceneBlock } from "../core/scene/scene-format.js";
+import { syncSceneIndex } from "../core/scene/scene-index.js";
 import { ManagedTimer } from "./managed-timer.js";
 import type { Logger } from "../core/types.js";
 import { formatLocalDateTime, startOfLocalDay } from "./time.js";
@@ -12,6 +14,8 @@ export interface MemoryCleanerOptions {
   cleanTime: string;
   logger?: Logger;
   vectorStore?: IMemoryStore;
+  /** L2 scene blocks TTL in days. 0 = skip scene cleanup. Default: 30 */
+  sceneTtlDays?: number;
 }
 
 interface CleanupStats {
@@ -184,6 +188,12 @@ export class LocalMemoryCleaner {
       `${TAG} Cleanup done: scannedFiles=${total.scannedFiles}, changedFiles=${total.changedFiles}, skippedNonShardFiles=${total.skippedNonShardFiles}, deleteFailedFiles=${total.deleteFailedFiles}`,
     );
 
+    // ── L2 scene blocks TTL cleanup ──
+    const sceneTtlDays = this.opts.sceneTtlDays ?? 30;
+    if (sceneTtlDays > 0) {
+      await this.cleanupSceneBlocks(sceneTtlDays, nowMs);
+    }
+
   }
 
   private scheduleNext(): void {
@@ -275,6 +285,84 @@ export class LocalMemoryCleaner {
     }
 
     return stats;
+  }
+
+  private async cleanupSceneBlocks(sceneTtlDays: number, nowMs: number): Promise<void> {
+    const SCENE_DIR_NAME = "scene_blocks";
+    const MIN_RETAIN_SCENES = 3;
+    const sceneDir = path.join(this.opts.baseDir, SCENE_DIR_NAME);
+    const expiredDir = path.join(this.opts.baseDir, ".backup", "scene_blocks_expired");
+    const cutoffMs = nowMs - sceneTtlDays * 86_400_000;
+
+    let files: string[];
+    try {
+      const entries = await fs.readdir(sceneDir, { withFileTypes: true });
+      files = entries.filter((e) => e.isFile() && e.name.endsWith(".md")).map((e) => e.name);
+    } catch {
+      this.opts.logger?.debug?.(`${TAG} scene_blocks not present, skipping L2 cleanup`);
+      return;
+    }
+
+    type SceneInfo = { filename: string; updatedMs: number; heat: number };
+    const scenes: SceneInfo[] = [];
+    for (const file of files) {
+      try {
+        const raw = await fs.readFile(path.join(sceneDir, file), "utf-8");
+        const block = parseSceneBlock(raw, file);
+        const updatedMs = Date.parse(block.meta.updated);
+        scenes.push({
+          filename: file,
+          updatedMs: Number.isFinite(updatedMs) ? updatedMs : 0,
+          heat: block.meta.heat,
+        });
+      } catch {
+        // Skip unreadable files
+      }
+    }
+
+    const byHeat = [...scenes].sort((a, b) => b.heat - a.heat);
+    const protectedFilenames = new Set(byHeat.slice(0, MIN_RETAIN_SCENES).map((s) => s.filename));
+
+    const expired = scenes.filter(
+      (s) => !protectedFilenames.has(s.filename) && s.updatedMs < cutoffMs,
+    );
+
+    if (expired.length === 0) {
+      this.opts.logger?.debug?.(`${TAG} L2 cleanup: no expired scenes`);
+      return;
+    }
+
+    await fs.mkdir(expiredDir, { recursive: true });
+    let deleted = 0;
+    for (const s of expired) {
+      const src = path.join(sceneDir, s.filename);
+      const dst = path.join(expiredDir, s.filename);
+      try {
+        await fs.copyFile(src, dst);
+        await fs.unlink(src);
+        deleted++;
+      } catch (err) {
+        this.opts.logger?.warn?.(
+          `${TAG} L2 cleanup: failed to remove ${s.filename}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
+
+    this.opts.logger?.info?.(
+      `${TAG} L2 cleanup: removed ${deleted} expired scenes (retention=${sceneTtlDays}d, retained ${scenes.length - deleted}/${scenes.length})`,
+    );
+
+    try {
+      await syncSceneIndex(this.opts.baseDir);
+    } catch (err) {
+      this.opts.logger?.warn?.(
+        `${TAG} L2 cleanup: scene index sync failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
   }
 }
 
