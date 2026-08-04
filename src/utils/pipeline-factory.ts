@@ -519,6 +519,7 @@ export function createL2Runner(opts: {
       sceneGrowthLimit: cfg.persona.sceneGrowthLimit,
       sceneCreateThresholdMemories: cfg.persona.sceneCreateThresholdMemories,
       sceneCreateThresholdSessions: cfg.persona.sceneCreateThresholdSessions,
+      sceneFullRewriteIntervalHours: cfg.persona.sceneFullRewriteIntervalHours,
       logger,
       instanceId,
       llmRunner,

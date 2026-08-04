@@ -71,6 +71,12 @@ export interface SceneExtractorOptions {
   sceneCreateThresholdMemories?: number;
   /** Candidate pool: session count threshold (default 3). */
   sceneCreateThresholdSessions?: number;
+  /**
+   * Full rewrite interval in hours. UPDATEs beyond this must use write (full
+   * rewrite), not edit (micro). Threaded through to the LLM prompt via
+   * `buildSceneExtractionPrompt`. Default 24.
+   */
+  sceneFullRewriteIntervalHours?: number;
 }
 
 /**
@@ -162,18 +168,20 @@ export class SceneExtractor {
   private sceneGrowthLimit: number;
   private sceneCreateThresholdMemories: number;
   private sceneCreateThresholdSessions: number;
+  private sceneFullRewriteIntervalHours: number;
 
   constructor(opts: SceneExtractorOptions) {
     this.dataDir = opts.dataDir;
     this.maxScenes = opts.maxScenes ?? 15;
     this.sceneBackupCount = opts.sceneBackupCount ?? 10;
-    this.timeoutMs = opts.timeoutMs ?? 300_000; // 5 min — LLM may do multiple tool calls
+    this.timeoutMs = opts.timeoutMs ?? 300_000; // 5 min - LLM may do multiple tool calls
     this.logger = opts.logger;
     this.instanceId = opts.instanceId;
     this.sceneMaxChars = opts.sceneMaxChars ?? 2000;
     this.sceneGrowthLimit = opts.sceneGrowthLimit ?? 1.5;
     this.sceneCreateThresholdMemories = opts.sceneCreateThresholdMemories ?? 5;
     this.sceneCreateThresholdSessions = opts.sceneCreateThresholdSessions ?? 3;
+    this.sceneFullRewriteIntervalHours = opts.sceneFullRewriteIntervalHours ?? 24;
 
     // Use injected LLMRunner if available, otherwise fall back to CleanContextRunner
     this.runner = opts.llmRunner ?? new CleanContextRunner({
@@ -272,6 +280,7 @@ export class SceneExtractor {
       sceneCountWarning,
       existingSceneFiles,
       maxScenes: this.maxScenes,
+      sceneFullRewriteIntervalHours: this.sceneFullRewriteIntervalHours,
     });
     this.logger?.debug?.(`${TAG} extract() prompt built: ${userPrompt.length} chars (${Date.now() - promptStartMs}ms)`);
 

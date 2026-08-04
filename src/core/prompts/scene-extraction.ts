@@ -27,7 +27,7 @@ export interface SceneExtractionPromptParams {
   memoriesJson: string;
   sceneSummaries: string;
   currentTimestamp: string;
-  /** @deprecated No longer used — scene-count discipline is auto-managed by the
+  /** @deprecated No longer used - scene-count discipline is auto-managed by the
    *  engineering layer (candidate pool, length cap, bloat detection). Retained on
    *  the interface for backward compatibility; callers may safely stop populating it. */
   sceneCountWarning?: string;
@@ -35,6 +35,13 @@ export interface SceneExtractionPromptParams {
   existingSceneFiles?: string[];
   /** Maximum number of scene blocks allowed */
   maxScenes: number;
+  /**
+   * Full rewrite interval in hours (default: 24). UPDATEs beyond this must use
+   * write (full rewrite), not edit (micro). Threaded from
+   * `cfg.persona.sceneFullRewriteIntervalHours` so the user-configured value
+   * reaches the LLM prompt instead of a hardcoded "24 小时".
+   */
+  sceneFullRewriteIntervalHours?: number;
 }
 
 export interface SceneExtractionPromptResult {
@@ -47,11 +54,17 @@ export interface SceneExtractionPromptResult {
 // Contains maxScenes as a constraint parameter.
 // ============================
 
-function buildSceneSystemPrompt(maxScenes: number): string {
+function buildSceneSystemPrompt(maxScenes: number, sceneFullRewriteIntervalHours: number = 24): string {
   // Note: maxScenes is retained on the signature for callers but is no longer used
-  // to drive tiered warnings in the prompt — scene-count discipline is enforced by
+  // to drive tiered warnings in the prompt - scene-count discipline is enforced by
   // the engineering layer (Task 10: candidate pool + length cap + bloat detection).
   void maxScenes;
+
+  // Defensive: clamp to a sane positive integer so a misconfigured value can't
+  // produce nonsensical prompt text like "≥ 0 小时" or "≥ NaN 小时".
+  const intervalHours = Number.isFinite(sceneFullRewriteIntervalHours) && sceneFullRewriteIntervalHours > 0
+    ? Math.floor(sceneFullRewriteIntervalHours)
+    : 24;
 
   return `# Memory Consolidation Architect
 
@@ -139,8 +152,8 @@ function buildSceneSystemPrompt(maxScenes: number): string {
 **核心原则：唯一操作是 UPDATE。** 没有 MERGE、没有 CREATE。
 
 **UPDATE 模式选择**（基于每个场景 META 的 \`last_full_rewrite_at\` 字段）：
-- 距 \`last_full_rewrite_at\` < 24 小时 → **微调模式**：使用 **edit** 工具局部更新关键章节
-- 距 \`last_full_rewrite_at\` ≥ 24 小时 → **全量重写模式**：使用 **write** 工具**整体重写**该场景文件，更新 \`last_full_rewrite_at\` = 当前时间
+- 距 \`last_full_rewrite_at\` < ${intervalHours} 小时 → **微调模式**：使用 **edit** 工具局部更新关键章节
+- 距 \`last_full_rewrite_at\` ≥ ${intervalHours} 小时 → **全量重写模式**：使用 **write** 工具**整体重写**该场景文件，更新 \`last_full_rewrite_at\` = 当前时间
 
 **全量重写要求**：
 - 必须基于旧内容 + 新记忆**重新组织叙事**，不是拼接
@@ -222,9 +235,10 @@ export function buildSceneExtractionPrompt(params: SceneExtractionPromptParams):
     sceneCountWarning,
     existingSceneFiles,
     maxScenes,
+    sceneFullRewriteIntervalHours,
   } = params;
 
-  // sceneCountWarning is @deprecated — engineering layer auto-manages scene count
+  // sceneCountWarning is @deprecated - engineering layer auto-manages scene count
   // (TTL cleanup, candidate pool promotion). Always render empty to avoid
   // contradicting the UPDATE-only contract in systemPrompt.
   const warningSection = "";
@@ -247,7 +261,7 @@ ${currentTimestamp}
 ${fileListSection}`;
 
   return {
-    systemPrompt: buildSceneSystemPrompt(maxScenes),
+    systemPrompt: buildSceneSystemPrompt(maxScenes, sceneFullRewriteIntervalHours),
     userPrompt,
   };
 }
