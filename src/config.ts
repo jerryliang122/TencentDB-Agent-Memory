@@ -138,6 +138,24 @@ export interface RecallConfig {
    * when `subjectOnly=true`.
    */
   subjectHintChars: number;
+  /**
+   * Persist recalled L1 memories into the user-message transcript via
+   * `before_message_write` instead of OpenClaw's non-persistent
+   * `prependContext` (default: true).
+   *
+   * - `true` (default, cache-friendly): `<relevant-memories>` is written
+   *   into the JSONL user message so the model-facing prefix is identical
+   *   on the next turn, allowing the provider's prompt cache to hit the
+   *   full historical prefix. This is the recommended mode for long
+   *   multi-turn sessions.
+   * - `false` (legacy): memories are injected via `before_prompt_build`'s
+   *   `prependContext`, which OpenClaw applies only to the current turn
+   *   and does NOT persist. Every turn the previous user message reverts
+   *   to its bare form, busting the prompt cache from the first user
+   *   message onward. Use only if a downstream consumer cannot tolerate
+   *   `<relevant-memories>` tags in the transcript.
+   */
+  persistToTranscript: boolean;
 }
 
 /** Embedding service configuration for vector search. */
@@ -591,6 +609,7 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       timeoutMs: num(recallGroup, "timeoutMs") ?? 5000,
       subjectOnly: bool(recallGroup, "subjectOnly") ?? true,
       subjectHintChars: clampSubjectHintChars(num(recallGroup, "subjectHintChars") ?? 60),
+      persistToTranscript: bool(recallGroup, "persistToTranscript") ?? true,
     },
     embedding: {
       enabled: embeddingEnabled,

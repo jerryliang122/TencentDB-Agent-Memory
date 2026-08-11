@@ -6,6 +6,15 @@
 
 ## [Unreleased]
 
+### 🐛 修复
+
+- **自动召回 prompt cache 命中率修复**：新增 `recall.persistToTranscript` 配置（默认 `true`），将召回的 L1 记忆通过 `before_message_write` 持久化到 user message 的 JSONL transcript，替代 OpenClaw 不持久化的 `prependContext`。
+  - **根因**：OpenClaw 的 `before_prompt_build` → `prependContext` 路径在设计上仅对当前轮 user message 生效，不会写入 transcript（见 OpenClaw 测试 *"keeps before_prompt_build context in the model prompt and out of transcript messages"*）。下一轮重建 prompt 时，上一轮的 user message 回退为裸文本，与上一轮模型实际看到的前缀不再匹配，provider prompt cache 从首个 user message 起整段失效 —— 表现为"命中率直线下降"。
+  - **修复方式**：在 `before_prompt_build` 中将 `<relevant-memories>` 缓存到 `pendingTranscriptInjection`（不再返回 `prependContext`），在紧随其后的 `before_message_write` 中注入到 user message。模型直接从 `session.messages` 读到带记忆的版本（`installModelPromptTransform` 因无 `prependContext` 返回而成为 no-op，不会覆盖）。下一轮历史前缀字节一致，cache 正常命中。
+  - `appendSystemContext`（active scenes + tools guide，稳定内容）不变，继续走 system prompt cache。
+  - 设为 `false` 可回退旧的 strip 行为（仅当下游无法容忍 transcript 中存在 `<relevant-memories>` 标签时使用）。
+  - 原 `before_message_write` 的 strip 逻辑（CHANGELOG v0.3.x 引入）实际为 no-op —— OpenClaw 本身就不持久化 `prependContext`。新实现保留了 `persistToTranscript=false` 路径以兼容。
+
 ### ✨ 新功能
 
 - **L1 自动召回注入格式改造（subject-only 模式）**：召回的 L1 记忆不再注入完整 `content`，改为紧凑的"主题 + 内容首段提示 + record_id"单行格式：

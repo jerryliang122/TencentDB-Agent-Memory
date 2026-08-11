@@ -90,7 +90,8 @@
           "strategy": { "type": "string", "enum": ["embedding", "keyword", "hybrid"], "default": "hybrid", "description": "搜索策略：keyword(关键词)、embedding(向量)、hybrid(混合RRF融合，推荐)" },
           "timeoutMs": { "type": "number", "default": 5000, "description": "召回整体超时（毫秒），超时后跳过记忆注入并打印警告日志" },
           "subjectOnly": { "type": "boolean", "default": true, "description": "仅注入记忆主题（scene_name + content 首 N 字 + record_id）到提示词，而非完整 content。主 agent 通过 tdai_memory_get(record_id) 工具按需取回完整正文。设为 false 回退到旧的完整 content + 截断行为" },
-          "subjectHintChars": { "type": "integer", "default": 60, "minimum": 0, "maximum": 500, "description": "subjectOnly=true 时 content 首段提示字符数（按 Unicode code point 计）。0 = 纯主题模式（不注入任何 content 片段，仅靠 scene_name + type + 时间判断是否取回原文）；>0 = 主题 + 首 N 字 + '…'。仅 subjectOnly=true 时生效" }
+          "subjectHintChars": { "type": "integer", "default": 60, "minimum": 0, "maximum": 500, "description": "subjectOnly=true 时 content 首段提示字符数（按 Unicode code point 计）。0 = 纯主题模式（不注入任何 content 片段，仅靠 scene_name + type + 时间判断是否取回原文）；>0 = 主题 + 首 N 字 + '…'。仅 subjectOnly=true 时生效" },
+          "persistToTranscript": { "type": "boolean", "default": true, "description": "将召回的 L1 记忆通过 before_message_write 持久化到 user message 的 JSONL transcript（而非 OpenClaw 不持久化的 prependContext）。默认 true（缓存友好）：模型每轮看到的历史前缀字节一致，provider prompt cache 能命中完整历史前缀。设为 false 回退到旧行为：prependContext 仅注入当前轮、下一轮丢失，每轮从首个 user message 起打断缓存（仅当下游无法容忍 transcript 中存在 <relevant-memories> 标签时使用）" }
         }
       },
       "embedding": {

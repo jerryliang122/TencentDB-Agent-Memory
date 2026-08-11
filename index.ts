@@ -89,6 +89,28 @@ const pendingRecallCache = new Map<string, {
  */
 const pendingRecallEndTimestamps = new Map<string, number>();
 
+/**
+ * Pending `<relevant-memories>` text waiting to be persisted into the
+ * current-turn user message via `before_message_write`.
+ *
+ * Populated by `before_prompt_build` (when `recall.persistToTranscript`
+ * is enabled) and consumed exactly once by `before_message_write`.
+ * Keyed by sessionKey.
+ *
+ * Why this exists: OpenClaw's `prependContext` is deliberately NOT
+ * persisted to the transcript (see OpenClaw test
+ * "keeps before_prompt_build context in the model prompt and out of
+ * transcript messages"). That means on turn N+1 the previous user
+ * message reverts to its bare form, busting the provider prompt cache
+ * from the first user message onward. By persisting the memories here
+ * instead, the model-facing prefix is byte-identical across turns and
+ * the cache stays warm. The model reads the memories directly from
+ * `session.messages` (no `prependContext` is returned, so
+ * `installModelPromptTransform` is a no-op and does not override the
+ * persisted content).
+ */
+const pendingTranscriptInjection = new Map<string, { text: string; ts: number }>();
+
 // 进程级单例，避免同一进程重复启动清理器导致并发清理竞态
 let sharedMemoryCleaner: LocalMemoryCleaner | undefined;
 
@@ -112,7 +134,13 @@ function sweepStaleCaches(): void {
       pendingRecallCache.delete(key);
     }
   }
-  // Hard limit: evict oldest entries if either Map exceeds cap
+  // Clean pendingTranscriptInjection (same TTL as prompt cache)
+  for (const [key, entry] of pendingTranscriptInjection) {
+    if (now - entry.ts > PROMPT_CACHE_TTL_MS) {
+      pendingTranscriptInjection.delete(key);
+    }
+  }
+  // Hard limit: evict oldest entries if any Map exceeds cap
   if (pendingOriginalPrompts.size > PROMPT_CACHE_MAX_SIZE) {
     const entries = [...pendingOriginalPrompts.entries()].sort((a, b) => a[1].ts - b[1].ts);
     const toEvict = entries.slice(0, entries.length - PROMPT_CACHE_MAX_SIZE);
@@ -126,6 +154,13 @@ function sweepStaleCaches(): void {
     const toEvict = entries.slice(0, entries.length - PROMPT_CACHE_MAX_SIZE);
     for (const [key] of toEvict) {
       pendingRecallCache.delete(key);
+    }
+  }
+  if (pendingTranscriptInjection.size > PROMPT_CACHE_MAX_SIZE) {
+    const entries = [...pendingTranscriptInjection.entries()].sort((a, b) => a[1].ts - b[1].ts);
+    const toEvict = entries.slice(0, entries.length - PROMPT_CACHE_MAX_SIZE);
+    for (const [key] of toEvict) {
+      pendingTranscriptInjection.delete(key);
     }
   }
 }
@@ -689,6 +724,29 @@ export default function register(api: OpenClawPluginApi) {
         } else {
           api.logger.info(`${TAG} [before_prompt_build] Recall complete (${elapsedMs}ms), no context to inject`);
         }
+
+        // When persistToTranscript is enabled, hand the L1 prependContext to
+        // before_message_write so it gets written into the JSONL user message
+        // (keeping the model-facing prefix stable across turns for prompt
+        // caching) instead of returning it via OpenClaw's prependContext
+        // channel (which is intentionally not persisted and would bust the
+        // cache from the first user message onward on every subsequent turn).
+        if (cfg.recall.persistToTranscript && sessionKey && result?.prependContext) {
+          pendingTranscriptInjection.set(sessionKey, {
+            text: result.prependContext,
+            ts: Date.now(),
+          });
+          api.logger.debug?.(
+            `${TAG} [before_prompt_build] Queued ${result.prependContext.length} chars of ` +
+            `prependContext for before_message_write (persistToTranscript=true)`,
+          );
+          // Return result without prependContext so OpenClaw does not
+          // double-inject via its own (non-persistent) prependContext path.
+          // appendSystemContext (active scenes, tools guide) is stable and
+          // remains in the system prompt where it is cacheable.
+          return { ...result, prependContext: undefined };
+        }
+
         return result;
       } catch (err) {
         const elapsedMs = Date.now() - startMs;
@@ -707,26 +765,80 @@ export default function register(api: OpenClawPluginApi) {
     });
   }
 
-  // Strip <relevant-memories> from user messages before they are persisted to
-  // the session JSONL.  The current-turn LLM already saw the full prompt
-  // (effectivePrompt lives in memory), but we don't want recall artifacts
-  // polluting the historical transcript for future replays.
-  api.logger.debug?.(`${TAG} Registering before_message_write hook (strip <relevant-memories>)`);
-  api.on("before_message_write", (event) => {
+  // Persist `<relevant-memories>` into the user message transcript (when
+  // `recall.persistToTranscript` is enabled) OR strip stale tags from
+  // historical messages (when disabled).
+  //
+  // persistToTranscript=true (default, cache-friendly):
+  //   before_prompt_build queues the recalled L1 memories here, and we
+  //   prepend them to the user message BEFORE it is written to JSONL.
+  //   The model reads them directly from session.messages (no
+  //   prependContext is returned, so installModelPromptTransform is a
+  //   no-op). Because the transcript now stores the exact bytes the
+  //   model saw, the provider prompt-cache prefix stays identical on
+  //   the next turn.
+  //
+  // persistToTranscript=false (legacy):
+  //   Strip <relevant-memories> tags from user messages before
+  //   persistence. This path is retained for users who cannot tolerate
+  //   recall artifacts in the transcript; it busts the prompt cache
+  //   every turn and is not recommended.
+  api.logger.debug?.(`${TAG} Registering before_message_write hook (persistToTranscript=${cfg.recall.persistToTranscript})`);
+  api.on("before_message_write", (event, ctx) => {
     const msg = event.message as { role?: string; content?: unknown };
     const contentType = typeof msg.content === "string" ? "string" : Array.isArray(msg.content) ? "parts" : typeof msg.content;
     api.logger.debug?.(`${TAG} [before_message_write] role=${msg.role}, contentType=${contentType}`);
 
     if (msg.role !== "user") return;
 
-    // UserMessage.content: string | (TextContent | ImageContent)[]
+    const sessionKey = ctx?.sessionKey;
+
+    if (cfg.recall.persistToTranscript) {
+      // ── Inject mode: prepend queued <relevant-memories> into the
+      // current-turn user message so it is persisted to JSONL. ──
+      if (!sessionKey) return;
+      const pending = pendingTranscriptInjection.get(sessionKey);
+      if (!pending) return;
+      // Consume exactly once - subsequent before_message_write calls for
+      // the same sessionKey (e.g. tool-result flushes, repair appends)
+      // must not re-inject.
+      pendingTranscriptInjection.delete(sessionKey);
+
+      const prependText = pending.text;
+      api.logger.debug?.(
+        `${TAG} [before_message_write] Injecting ${prependText.length} chars of ` +
+        `<relevant-memories> into user message (persistToTranscript=true)`,
+      );
+
+      if (typeof msg.content === "string") {
+        if (msg.content.includes("<relevant-memories>")) return; // idempotent guard
+        const newContent = `${prependText}\n\n${msg.content}`;
+        return { message: { ...event.message, content: newContent } as typeof event.message };
+      }
+
+      if (Array.isArray(msg.content)) {
+        let injected = false;
+        const newParts = (msg.content as Array<Record<string, unknown>>).map((part) => {
+          if (injected) return part;
+          if (part.type !== "text" || typeof part.text !== "string") return part;
+          if ((part.text as string).includes("<relevant-memories>")) return part;
+          injected = true;
+          return { ...part, text: `${prependText}\n\n${part.text}` };
+        });
+        if (!injected) return;
+        return { message: { ...event.message, content: newParts } as unknown as typeof event.message };
+      }
+      return;
+    }
+
+    // ── Legacy strip mode (persistToTranscript=false). ──
     const STRIP_RE = /<relevant-memories>[\s\S]*?<\/relevant-memories>\s*/g;
 
     if (typeof msg.content === "string") {
       if (!msg.content.includes("<relevant-memories>")) return;
       const cleaned = msg.content.replace(STRIP_RE, "").trim();
       if (cleaned === msg.content) return;
-      api.logger.debug?.(`${TAG} [before_message_write] Stripped: ${msg.content.length} → ${cleaned.length} chars`);
+      api.logger.debug?.(`${TAG} [before_message_write] Stripped: ${msg.content.length} -> ${cleaned.length} chars`);
       return { message: { ...event.message, content: cleaned } as typeof event.message };
     }
 
