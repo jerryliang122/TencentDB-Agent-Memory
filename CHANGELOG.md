@@ -8,6 +8,12 @@
 
 ### 🐛 修复
 
+- **召回阈值（`recall.scoreThreshold`）真正在 3 条召回路径上生效**：修复 hybrid / keyword / TCVDB 原生 hybrid 路径下阈值变成"装饰"的 3 个机械缺陷。修复后语义清晰：**无强相关内容 → 不召回 L1**（active scenes 注入不变，与 L1 召回独立）。
+  - **影响（预期行为）**：召回数量可能显著下降 —— 这正是修复目标。BGE-M3 / bge-large-zh 用户特别建议把 `recall.scoreThreshold` 从默认 `0.3` 调到 **`0.55` ~ `0.60`**（BGE 系列的"强相关下沿"）。OpenAI `text-embedding-3-small` 用户 `0.40 ~ 0.45` 已足够。
+  - **修复 1（hybrid RRF 合并）**：原 `searchHybrid` 的 `_threshold` 参数被故意忽略（下划线前缀），FTS / embedding 两路候选池合并后只按 RRF 排序、不按分数过滤，导致 `maxResults=5` 总会被弱匹配填满。修复为：合并前对两路候选按各自原始分数 `>= threshold` 预过滤。
+  - **修复 2（FTS 小文档集逃生舱）**：原"小语料时全部返回"的逃生舱没有任何分数下限，连 BM25 分数 0.001 的无关项也会注入。修复为：逃生舱使用 `threshold * 0.5` 作为宽松下限（保留 IDF≈0 时的逃生意图，同时仍能过滤明显无关项）。该倍数显式记录在 CHANGELOG，方便后续根据反馈微调。
+  - **修复 3（TCVDB 原生 hybrid 客户端兜底）**：TCVDB 服务端做 dense+sparse+RRF 合并后客户端直接输出，无任何过滤。修复为：客户端补 `r.score >= threshold` 兜底过滤。
+  - **不改默认值**：`scoreThreshold` 默认仍为 `0.3`，用户根据自己 embedding 模型的相似度分布自行调优。
 - **自动召回 prompt cache 命中率修复**：新增 `recall.persistToTranscript` 配置（默认 `true`），将召回的 L1 记忆通过 `before_message_write` 持久化到 user message 的 JSONL transcript，替代 OpenClaw 不持久化的 `prependContext`。
   - **根因**：OpenClaw 的 `before_prompt_build` → `prependContext` 路径在设计上仅对当前轮 user message 生效，不会写入 transcript（见 OpenClaw 测试 *"keeps before_prompt_build context in the model prompt and out of transcript messages"*）。下一轮重建 prompt 时，上一轮的 user message 回退为裸文本，与上一轮模型实际看到的前缀不再匹配，provider prompt cache 从首个 user message 起整段失效 —— 表现为"命中率直线下降"。
   - **修复方式**：在 `before_prompt_build` 中将 `<relevant-memories>` 缓存到 `pendingTranscriptInjection`（不再返回 `prependContext`），在紧随其后的 `before_message_write` 中注入到 user message。模型直接从 `session.messages` 读到带记忆的版本（`installModelPromptTransform` 因无 `prependContext` 返回而成为 no-op，不会覆盖）。下一轮历史前缀字节一致，cache 正常命中。
