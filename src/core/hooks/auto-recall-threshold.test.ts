@@ -143,4 +143,92 @@ describe("performAutoRecall - scoreThreshold filter (hybrid path)", () => {
     // No scenes file → undefined
     expect(result).toBeUndefined();
   });
+
+  it("preserves FTS-passing candidates when embedding candidates all fail threshold", async () => {
+    // FTS score 0.5 passes default threshold 0.3; embedding score 0.1 fails
+    const store = makeStore({
+      vecResults: [makeL1Hit({ record_id: "m_v_low", score: 0.1 })],
+      ftsResults: [makeFtsHit({ record_id: "m_f_pass", content: "fts hit", score: 0.5 })],
+      ftsAvailable: true,
+    });
+    const result = await performAutoRecall({
+      userText: "请帮我查询项目进度",
+      actorId: "test",
+      sessionKey: "sess-1",
+      cfg: makeCfg({ strategy: "hybrid" }),
+      pluginDataDir: "/nonexistent",
+      vectorStore: store,
+      embeddingService: makeEmbedder(),
+    });
+    // Should inject exactly 1 memory (the FTS-passing one), not 2
+    expect(result?.prependContext).toBeDefined();
+    expect(result!.prependContext!).toContain("m_f_pass");
+    expect(result!.prependContext!).not.toContain("m_v_low");
+  });
+
+  it("preserves embedding-passing candidates when FTS candidates all fail threshold", async () => {
+    const store = makeStore({
+      vecResults: [makeL1Hit({ record_id: "m_v_pass", content: "vec hit", score: 0.6 })],
+      ftsResults: [makeFtsHit({ record_id: "m_f_low", score: 0.1 })],
+      ftsAvailable: true,
+    });
+    const result = await performAutoRecall({
+      userText: "请帮我查询项目进度",
+      actorId: "test",
+      sessionKey: "sess-1",
+      cfg: makeCfg({ strategy: "hybrid" }),
+      pluginDataDir: "/nonexistent",
+      vectorStore: store,
+      embeddingService: makeEmbedder(),
+    });
+    expect(result?.prependContext).toBeDefined();
+    expect(result!.prependContext!).toContain("m_v_pass");
+    expect(result!.prependContext!).not.toContain("m_f_low");
+  });
+
+  it("dedupes when the same record_id passes both paths (RRF merge keeps one)", async () => {
+    // Same record_id m_dup, both score above threshold
+    const store = makeStore({
+      vecResults: [makeL1Hit({ record_id: "m_dup", content: "shared hit", score: 0.7 })],
+      ftsResults: [makeFtsHit({ record_id: "m_dup", content: "shared hit", score: 0.6 })],
+      ftsAvailable: true,
+    });
+    const result = await performAutoRecall({
+      userText: "请帮我查询项目进度",
+      actorId: "test",
+      sessionKey: "sess-1",
+      cfg: makeCfg({ strategy: "hybrid" }),
+      pluginDataDir: "/nonexistent",
+      vectorStore: store,
+      embeddingService: makeEmbedder(),
+    });
+    expect(result?.prependContext).toBeDefined();
+    // Should appear exactly once in injected context
+    const occurrences = (result!.prependContext!.match(/m_dup/g) ?? []).length;
+    expect(occurrences).toBe(1);
+  });
+
+  it("threshold=0 disables filtering (boundary case)", async () => {
+    // All scores 0.1 but threshold=0 → all pass
+    const store = makeStore({
+      vecResults: [
+        makeL1Hit({ record_id: "m_v1", content: "low score 1", score: 0.1 }),
+        makeL1Hit({ record_id: "m_v2", content: "low score 2", score: 0.05 }),
+      ],
+      ftsResults: [],
+      ftsAvailable: true,
+    });
+    const result = await performAutoRecall({
+      userText: "请帮我查询项目进度",
+      actorId: "test",
+      sessionKey: "sess-1",
+      cfg: makeCfg({ strategy: "hybrid", scoreThreshold: 0 }),
+      pluginDataDir: "/nonexistent",
+      vectorStore: store,
+      embeddingService: makeEmbedder(),
+    });
+    expect(result?.prependContext).toBeDefined();
+    expect(result!.prependContext!).toContain("m_v1");
+    expect(result!.prependContext!).toContain("m_v2");
+  });
 });
