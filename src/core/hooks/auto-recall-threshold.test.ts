@@ -301,3 +301,56 @@ describe("performAutoRecall - scoreThreshold filter (keyword path)", () => {
     expect(result).toBeUndefined();
   });
 });
+
+describe("performAutoRecall - scoreThreshold filter (TCVDB native hybrid path)", () => {
+  it("filters out server-returned candidates below threshold", async () => {
+    // Native hybrid returns 5 results all below default 0.3 -> client backstop filters all
+    const store = makeStore({
+      nativeHybrid: true,
+      hybridResults: Array.from({ length: 5 }, (_, i) =>
+        makeL1Hit({ record_id: `m_n${i}`, score: 0.20 }),
+      ),
+      ftsAvailable: true,
+    });
+    const result = await performAutoRecall({
+      userText: "请帮我查询项目进度",
+      actorId: "test",
+      sessionKey: "sess-1",
+      cfg: makeCfg({ strategy: "hybrid" }),
+      pluginDataDir: "/nonexistent",
+      vectorStore: store,
+      embeddingService: makeEmbedder(),
+    });
+    expect(result).toBeUndefined();
+  });
+
+  it("returns only server-returned candidates above threshold", async () => {
+    // 5 results, 2 above 0.3, 3 below -> only the 2 above injected
+    const store = makeStore({
+      nativeHybrid: true,
+      hybridResults: [
+        makeL1Hit({ record_id: "m_pass1", content: "pass 1", score: 0.55 }),
+        makeL1Hit({ record_id: "m_pass2", content: "pass 2", score: 0.45 }),
+        makeL1Hit({ record_id: "m_fail1", content: "fail 1", score: 0.25 }),
+        makeL1Hit({ record_id: "m_fail2", content: "fail 2", score: 0.20 }),
+        makeL1Hit({ record_id: "m_fail3", content: "fail 3", score: 0.10 }),
+      ],
+      ftsAvailable: true,
+    });
+    const result = await performAutoRecall({
+      userText: "请帮我查询项目进度",
+      actorId: "test",
+      sessionKey: "sess-1",
+      cfg: makeCfg({ strategy: "hybrid" }),
+      pluginDataDir: "/nonexistent",
+      vectorStore: store,
+      embeddingService: makeEmbedder(),
+    });
+    expect(result?.prependContext).toBeDefined();
+    expect(result!.prependContext!).toContain("m_pass1");
+    expect(result!.prependContext!).toContain("m_pass2");
+    expect(result!.prependContext!).not.toContain("m_fail1");
+    expect(result!.prependContext!).not.toContain("m_fail2");
+    expect(result!.prependContext!).not.toContain("m_fail3");
+  });
+});

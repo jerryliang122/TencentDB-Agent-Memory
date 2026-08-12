@@ -399,9 +399,19 @@ async function searchMemories(
     // to avoid a redundant second HTTP request and a wasted local embed().
     if (vectorStore?.getCapabilities().nativeHybridSearch) {
       const tNative = performance.now();
-      const results = await vectorStore.searchL1Hybrid({ query: cleanText, topK: maxResults });
+      const rawResults = await vectorStore.searchL1Hybrid({ query: cleanText, topK: maxResults });
       const nativeMs = performance.now() - tNative;
-      logger?.debug?.(`${TAG} [hybrid-native] Single-call hybrid: ${results.length} results in ${nativeMs.toFixed(0)}ms`);
+      // Client-side backstop: TCVDB does server-side dense+sparse+RRF merge,
+      // but may not honor the user's configured scoreThreshold. Filter here
+      // as the last line of defense so weak server-merged candidates don't
+      // get injected when the user set a stricter threshold.
+      const results = rawResults.filter((r) => r.score >= threshold);
+      logger?.debug?.(
+        `${TAG} [hybrid-native] ${rawResults.length} -> ${results.length} results after threshold=${threshold} filter (${nativeMs.toFixed(0)}ms)`,
+      );
+      if (results.length === 0) {
+        return { lines: [], timing: { ftsMs: 0, embeddingMs: nativeMs, ftsHits: 0, embeddingHits: 0 } };
+      }
       const lines = results.map((r) => formatMemoryLine(vectorResultToFormatable(r), formatOpts));
       return { lines, timing: { ftsMs: 0, embeddingMs: nativeMs, ftsHits: 0, embeddingHits: results.length } };
     }
