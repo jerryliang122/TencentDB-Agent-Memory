@@ -119,7 +119,13 @@ async function performAutoRecallInner(params: {
   const { userText, cfg, pluginDataDir, logger, vectorStore, embeddingService } = params;
   const tRecallStart = performance.now();
 
-  // Search relevant memories (L1 layer) — skip only when userText is empty/undefined
+  // Search relevant memories (L1 layer).
+  // Skip L1 search when:
+  //   - userText is empty/undefined, OR
+  //   - sanitized text is shorter than `cfg.recall.minQueryChars` (default 6).
+  // Short acknowledgments ("好的", "嗯", "ok", "对") carry no semantic intent
+  // and produce noisy recall results. Active scenes are still injected below
+  // (they are stable, cacheable context independent of the user message).
   const tSearchStart = performance.now();
   let memoryLines: string[] = [];
   let effectiveStrategy = "skipped";
@@ -128,23 +134,34 @@ async function performAutoRecallInner(params: {
   if (!userText || userText.length === 0) {
     logger?.debug?.(`${TAG} User text empty/undefined, skipping memory search (scenes still injected)`);
   } else {
-    effectiveStrategy = cfg.recall.strategy ?? "hybrid";
-    const searchResult = await searchMemories(userText, pluginDataDir, cfg, logger, effectiveStrategy as "keyword" | "embedding" | "hybrid", vectorStore, embeddingService);
-    memoryLines = searchResult.lines;
-    searchTiming = searchResult.timing;
-    memoryLines = applyRecallBudget(memoryLines, cfg.recall, logger);
+    const minQueryChars = cfg.recall.minQueryChars ?? 6;
+    const cleanText = sanitizeText(userText);
+    if (cleanText.length < minQueryChars) {
+      logger?.info?.(
+        `${TAG} User text too short for memory search ` +
+        `(raw=${userText.length}, clean=${cleanText.length}, minQueryChars=${minQueryChars}), ` +
+        `skipping L1 memory search (scenes still injected)`,
+      );
+      effectiveStrategy = "skipped-short";
+    } else {
+      effectiveStrategy = cfg.recall.strategy ?? "hybrid";
+      const searchResult = await searchMemories(userText, pluginDataDir, cfg, logger, effectiveStrategy as "keyword" | "embedding" | "hybrid", vectorStore, embeddingService);
+      memoryLines = searchResult.lines;
+      searchTiming = searchResult.timing;
+      memoryLines = applyRecallBudget(memoryLines, cfg.recall, logger);
 
-    // Extract structured RecalledMemory from formatted lines for metric reporting
-    recalledL1Memories = memoryLines.map((line) => {
-      const match = line.match(/^-\s+\[([^\]]+)\]\s+(.+?)(?:\s*\(活动时间:.*\))?$/);
-      if (match) {
-        const tag = match[1];
-        const content = match[2].trim();
-        const typePart = tag.includes("|") ? tag.split("|")[0] : tag;
-        return { content, score: 0, type: typePart };
-      }
-      return { content: line, score: 0, type: "unknown" };
-    });
+      // Extract structured RecalledMemory from formatted lines for metric reporting
+      recalledL1Memories = memoryLines.map((line) => {
+        const match = line.match(/^-\s+\[([^\]]+)\]\s+(.+?)(?:\s*\(活动时间:.*\))?$/);
+        if (match) {
+          const tag = match[1];
+          const content = match[2].trim();
+          const typePart = tag.includes("|") ? tag.split("|")[0] : tag;
+          return { content, score: 0, type: typePart };
+        }
+        return { content: line, score: 0, type: "unknown" };
+      });
+    }
   }
   const tSearchEnd = performance.now();
 

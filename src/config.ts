@@ -108,6 +108,25 @@ export interface RecallConfig {
   maxTotalRecallChars: number;
   /** Minimum score threshold (default: 0.3) */
   scoreThreshold: number;
+  /**
+   * Minimum sanitized user-text length (in Unicode code points) required to
+   * trigger L1 memory search (default: 6).
+   *
+   * Short messages (acknowledgments like "好的", "嗯", "ok", "对") carry no
+   * semantic intent and produce noisy recall results. When the sanitized
+   * user text is shorter than this threshold, L1 memory search is skipped
+   * entirely (active scenes are still injected - they are stable, cacheable
+   * context independent of the user message).
+   *
+   * - `0` disables the gate (restores pre-gate behavior; not recommended).
+   * - `2` matches the historical hard floor (only filters empty/whitespace).
+   * - `6` (default) filters common Chinese/English acknowledgments.
+   *
+   * Counted on the sanitized text (after `sanitizeText` strips injected
+   * tags, metadata blocks, media markers, etc.), so framework-injected
+   * prefixes don't inflate the length.
+   */
+  minQueryChars: number;
   /** Search strategy (default: "hybrid") */
   strategy: "embedding" | "keyword" | "hybrid";
   /** Overall recall timeout in milliseconds (default: 5000). When exceeded, recall is skipped with a warning. */
@@ -605,6 +624,7 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       maxCharsPerMemory: num(recallGroup, "maxCharsPerMemory") ?? 0,
       maxTotalRecallChars: num(recallGroup, "maxTotalRecallChars") ?? 0,
       scoreThreshold: num(recallGroup, "scoreThreshold") ?? 0.3,
+      minQueryChars: clampMinQueryChars(num(recallGroup, "minQueryChars") ?? 6),
       strategy: validateStrategy(str(recallGroup, "strategy")) ?? "hybrid",
       timeoutMs: num(recallGroup, "timeoutMs") ?? 5000,
       subjectOnly: bool(recallGroup, "subjectOnly") ?? true,
@@ -735,6 +755,21 @@ function validateStrategy(value: string | undefined): RecallConfig["strategy"] |
 function clampSubjectHintChars(value: number | undefined): number {
   if (value == null || !Number.isFinite(value)) return 60;
   if (value < 0) return 60;
+  return Math.min(Math.floor(value), 500);
+}
+
+/**
+ * Clamp `recall.minQueryChars` to the valid range `[0, 500]`.
+ *
+ * Defensive: the plugin JSON schema declares `minimum: 0, maximum: 500`, but
+ * users editing `opencode.json` directly can bypass that. Negative or
+ * non-finite values fall back to the default (6). The upper bound mirrors
+ * `subjectHintChars` to keep config validation uniform - anything above a
+ * few hundred chars would block virtually all real queries.
+ */
+function clampMinQueryChars(value: number | undefined): number {
+  if (value == null || !Number.isFinite(value)) return 6;
+  if (value < 0) return 6;
   return Math.min(Math.floor(value), 500);
 }
 

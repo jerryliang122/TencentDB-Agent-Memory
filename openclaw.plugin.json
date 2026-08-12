@@ -87,6 +87,7 @@
           "maxCharsPerMemory": { "type": "number", "default": 0, "description": "单条 L1 记忆注入的最大字符数；填 0 表示不限制" },
           "maxTotalRecallChars": { "type": "number", "default": 0, "description": "本轮 auto-recall 注入的 L1 记忆总字符预算；填 0 表示不限制" },
           "scoreThreshold": { "type": "number", "default": 0.3, "description": "最低分数阈值" },
+          "minQueryChars": { "type": "integer", "default": 6, "minimum": 0, "maximum": 500, "description": "触发 L1 记忆搜索所需的最小用户文本长度（按 sanitize 后的 Unicode code point 计，默认 6）。短于该阈值的应答词（如\"好的\"、\"嗯\"、\"ok\"、\"对\"）不携带语义意图，召回只会产生噪声，因此跳过 L1 搜索（active-scenes 仍照常注入）。设为 0 关闭该门控（不推荐）；设为 2 恢复历史最小行为" },
           "strategy": { "type": "string", "enum": ["embedding", "keyword", "hybrid"], "default": "hybrid", "description": "搜索策略：keyword(关键词)、embedding(向量)、hybrid(混合RRF融合，推荐)" },
           "timeoutMs": { "type": "number", "default": 5000, "description": "召回整体超时（毫秒），超时后跳过记忆注入并打印警告日志" },
           "subjectOnly": { "type": "boolean", "default": true, "description": "仅注入记忆主题（scene_name + content 首 N 字 + record_id）到提示词，而非完整 content。主 agent 通过 tdai_memory_get(record_id) 工具按需取回完整正文。设为 false 回退到旧的完整 content + 截断行为" },
