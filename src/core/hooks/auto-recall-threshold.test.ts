@@ -232,3 +232,72 @@ describe("performAutoRecall - scoreThreshold filter (hybrid path)", () => {
     expect(result!.prependContext!).toContain("m_v2");
   });
 });
+
+describe("performAutoRecall - scoreThreshold filter (keyword path)", () => {
+  it("small-docset escape hatch: filters out candidates below loose threshold", async () => {
+    // maxResults=5 default; ftsResults.length=3 (small docset) but all scores
+    // below loose threshold (0.3 * 0.5 = 0.15) → escape hatch returns empty
+    const store = makeStore({
+      ftsResults: [
+        makeFtsHit({ record_id: "m_f1", score: 0.05 }),
+        makeFtsHit({ record_id: "m_f2", score: 0.10 }),
+        makeFtsHit({ record_id: "m_f3", score: 0.14 }), // below 0.15
+      ],
+      ftsAvailable: true,
+    });
+    const result = await performAutoRecall({
+      userText: "请帮我查询项目进度",
+      actorId: "test",
+      sessionKey: "sess-1",
+      cfg: makeCfg({ strategy: "keyword" }),
+      pluginDataDir: "/nonexistent",
+      vectorStore: store,
+      embeddingService: makeEmbedder(),
+    });
+    expect(result).toBeUndefined();
+  });
+
+  it("small-docset escape hatch: returns candidates above loose threshold", async () => {
+    // Mixed: 1 above loose (0.15), 1 below; only the one above should be returned
+    const store = makeStore({
+      ftsResults: [
+        makeFtsHit({ record_id: "m_pass", content: "pass the loose floor", score: 0.20 }),
+        makeFtsHit({ record_id: "m_fail", content: "below loose floor", score: 0.05 }),
+      ],
+      ftsAvailable: true,
+    });
+    const result = await performAutoRecall({
+      userText: "请帮我查询项目进度",
+      actorId: "test",
+      sessionKey: "sess-1",
+      cfg: makeCfg({ strategy: "keyword" }),
+      pluginDataDir: "/nonexistent",
+      vectorStore: store,
+      embeddingService: makeEmbedder(),
+    });
+    expect(result?.prependContext).toBeDefined();
+    expect(result!.prependContext!).toContain("m_pass");
+    expect(result!.prependContext!).not.toContain("m_fail");
+  });
+
+  it("large docset (above maxResults) does not trigger escape hatch; strict threshold applies", async () => {
+    // 6 FTS hits (> maxResults=5) — escape hatch disabled, strict 0.3 applies.
+    // All scores below 0.3 → all filtered out by main path (not escape hatch).
+    const store = makeStore({
+      ftsResults: Array.from({ length: 6 }, (_, i) =>
+        makeFtsHit({ record_id: `m_f${i}`, score: 0.20 }),
+      ),
+      ftsAvailable: true,
+    });
+    const result = await performAutoRecall({
+      userText: "请帮我查询项目进度",
+      actorId: "test",
+      sessionKey: "sess-1",
+      cfg: makeCfg({ strategy: "keyword" }),
+      pluginDataDir: "/nonexistent",
+      vectorStore: store,
+      embeddingService: makeEmbedder(),
+    });
+    expect(result).toBeUndefined();
+  });
+});
