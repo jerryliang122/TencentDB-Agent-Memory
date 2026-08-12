@@ -547,7 +547,7 @@ async function searchHybrid(
   userText: string,
   _pluginDataDir: string,
   maxResults: number,
-  _threshold: number,
+  threshold: number,
   vectorStore: IMemoryStore,
   embeddingService: EmbeddingService,
   logger?: Logger,
@@ -570,23 +570,25 @@ async function searchHybrid(
             if (ftsResults.length > 0) {
               logger?.debug?.(`${TAG} [hybrid-keyword-fts] FTS5 found ${ftsResults.length} candidates`);
               // Convert FtsSearchResult to ScoredRecord for RRF merge
-              const records = ftsResults.map((r): ScoredRecord => ({
-                record: {
-                  id: r.record_id,
-                  content: r.content,
-                  type: r.type as MemoryRecord["type"],
-                  priority: r.priority,
-                  scene_name: r.scene_name,
-                  source_message_ids: [],
-                  metadata: r.metadata_json ? (() => { try { return JSON.parse(r.metadata_json); } catch { return {}; } })() : {},
-                  timestamps: [r.timestamp_str].filter(Boolean),
-                  createdAt: "",
-                  updatedAt: "",
-                  sessionKey: r.session_key,
-                  sessionId: r.session_id,
-                },
-                score: r.score,
-              }));
+              const records = ftsResults
+                .filter((r) => r.score >= threshold)
+                .map((r): ScoredRecord => ({
+                  record: {
+                    id: r.record_id,
+                    content: r.content,
+                    type: r.type as MemoryRecord["type"],
+                    priority: r.priority,
+                    scene_name: r.scene_name,
+                    source_message_ids: [],
+                    metadata: r.metadata_json ? (() => { try { return JSON.parse(r.metadata_json); } catch { return {}; } })() : {},
+                    timestamps: [r.timestamp_str].filter(Boolean),
+                    createdAt: "",
+                    updatedAt: "",
+                    sessionKey: r.session_key,
+                    sessionId: r.session_id,
+                  },
+                  score: r.score,
+                }));
               return { records, ms: performance.now() - tStart };
             }
           }
@@ -608,8 +610,11 @@ async function searchHybrid(
         logger?.debug?.(
           `${TAG} [hybrid-embedding] Embedding OK, dims=${queryEmbedding.length}, searching top-${candidateK}...`,
         );
-        const results = await vectorStore.searchL1Vector(queryEmbedding, candidateK, userText);
-        logger?.debug?.(`${TAG} [hybrid-embedding] Got ${results.length} candidates`);
+        const rawResults = await vectorStore.searchL1Vector(queryEmbedding, candidateK, userText);
+        const results = rawResults.filter((r) => r.score >= threshold);
+        logger?.debug?.(
+          `${TAG} [hybrid-embedding] Got ${rawResults.length} candidates, ${results.length} after threshold=${threshold} filter`,
+        );
         return { results, ms: performance.now() - tStart };
       } catch (err) {
         logger?.warn?.(`${TAG} Hybrid: embedding part failed: ${err instanceof Error ? err.message : String(err)}`);
