@@ -354,3 +354,50 @@ describe("performAutoRecall - scoreThreshold filter (TCVDB native hybrid path)",
     expect(result!.prependContext!).not.toContain("m_fail3");
   });
 });
+
+describe("performAutoRecall - scoreThreshold filter (embedding-only regression)", () => {
+  it("pure embedding strategy already filters by threshold (regression)", async () => {
+    // 3 candidates: 1 above 0.3, 2 below - only the above one injected
+    const store = makeStore({
+      vecResults: [
+        makeL1Hit({ record_id: "m_pass", content: "pass", score: 0.55 }),
+        makeL1Hit({ record_id: "m_low1", content: "low 1", score: 0.25 }),
+        makeL1Hit({ record_id: "m_low2", content: "low 2", score: 0.10 }),
+      ],
+      ftsAvailable: false,
+    });
+    const result = await performAutoRecall({
+      userText: "请帮我查询项目进度",
+      actorId: "test",
+      sessionKey: "sess-1",
+      cfg: makeCfg({ strategy: "embedding" }),
+      pluginDataDir: "/nonexistent",
+      vectorStore: store,
+      embeddingService: makeEmbedder(),
+    });
+    expect(result?.prependContext).toBeDefined();
+    expect(result!.prependContext!).toContain("m_pass");
+    expect(result!.prependContext!).not.toContain("m_low1");
+    expect(result!.prependContext!).not.toContain("m_low2");
+  });
+
+  it("pure embedding strategy returns undefined when all candidates below threshold (regression)", async () => {
+    const store = makeStore({
+      vecResults: [
+        makeL1Hit({ record_id: "m_low1", score: 0.25 }),
+        makeL1Hit({ record_id: "m_low2", score: 0.10 }),
+      ],
+      ftsAvailable: false,
+    });
+    const result = await performAutoRecall({
+      userText: "请帮我查询项目进度",
+      actorId: "test",
+      sessionKey: "sess-1",
+      cfg: makeCfg({ strategy: "embedding" }),
+      pluginDataDir: "/nonexistent",
+      vectorStore: store,
+      embeddingService: makeEmbedder(),
+    });
+    expect(result).toBeUndefined();
+  });
+});
