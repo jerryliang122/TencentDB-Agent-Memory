@@ -449,13 +449,25 @@ async function searchByKeyword(
 
         // BM25 absolute scores are unreliable when the document set is very
         // small (e.g. 1–3 records) because IDF approaches 0.  In that case,
-        // trust FTS5's MATCH + rank ordering and return the top results anyway.
+        // apply a relaxed threshold (half of primary) so the escape hatch
+        // still filters out clearly-irrelevant candidates while not being
+        // as strict as the main path. Without this floor, the escape hatch
+        // would return any MATCH regardless of score, defeating scoreThreshold.
         if (ftsResults.length <= maxResults) {
+          const looseThreshold = threshold * 0.5;
+          const loose = ftsResults.filter((r) => r.score >= looseThreshold);
+          if (loose.length > 0) {
+            logger?.debug?.(
+              `${TAG} [keyword-fts] Small docset escape hatch: ` +
+              `${loose.length}/${ftsResults.length} results above loose threshold=${looseThreshold.toFixed(4)} ` +
+              `(primary threshold=${threshold})`,
+            );
+            return loose.slice(0, maxResults).map((r) => formatMemoryLine(ftsResultToFormatable(r), formatOpts ?? DEFAULT_FORMAT_OPTS));
+          }
           logger?.debug?.(
-            `${TAG} [keyword-fts] All ${ftsResults.length} results below threshold=${threshold} ` +
-            `but document set is small — returning all matched results`,
+            `${TAG} [keyword-fts] Small docset escape hatch: 0/${ftsResults.length} above loose threshold=${looseThreshold.toFixed(4)}, returning empty`,
           );
-          return ftsResults.slice(0, maxResults).map((r) => formatMemoryLine(ftsResultToFormatable(r), formatOpts ?? DEFAULT_FORMAT_OPTS));
+          return [];
         }
         logger?.debug?.(`${TAG} [keyword-fts] FTS5 returned 0 results above threshold (from ${ftsResults.length} raw)`);
       }
