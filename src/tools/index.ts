@@ -2,12 +2,10 @@
  * Lazy-loaded tools module for memory-tencentdb plugin.
  */
 
-import type { IMemoryStore } from "../core/store/types.js";
-import type { EmbeddingService } from "../core/store/embedding.js";
-import type { Logger } from "../core/types.js";
-import { createMemorySearchTool, type MemoryToolOptions } from "./memory-search.js";
+import { createMemorySearchTool } from "./memory-search.js";
 import { createMemoryGetTool } from "./memory-get.js";
 import { createConversationSearchTool } from "./conversation-search.js";
+import type { MemoryToolOptions } from "./common.js";
 
 export { createMemorySearchTool, createMemoryGetTool, createConversationSearchTool };
 export type { MemoryToolOptions };

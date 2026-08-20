@@ -33,7 +33,6 @@ import {
   decideHookPolicy,
 } from "./src/utils/ensure-hook-policy.js";
 import { resolveOpenClawStateDir } from "./src/utils/openclaw-state-dir.js";
-import { sanitizeToolError } from "./src/tools/memory-get.js";
 import type { IMemoryStore } from "./src/core/store/types.js";
 import type { EmbeddingService } from "./src/core/store/embedding.js";
 import type { MemoryPipelineManager } from "./src/utils/pipeline-manager.js";

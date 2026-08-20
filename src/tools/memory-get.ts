@@ -5,6 +5,7 @@
 import type { IMemoryStore, L1RecordRow } from "../core/store/types.js";
 import type { Logger } from "../core/types.js";
 import type { AnyAgentTool } from "openclaw/plugin-sdk/plugin-entry";
+import type { MemoryToolOptions } from "./common.js";
 
 export interface MemoryGetResult {
   found: boolean;
@@ -111,12 +112,6 @@ export function formatMemoryGetResponse(result: MemoryGetResult): string {
   );
 
   return lines.join("\n");
-}
-
-export interface MemoryToolOptions {
-  vectorStore?: IMemoryStore;
-  embeddingService?: unknown;
-  logger?: Logger;
 }
 
 export function createMemoryGetTool(options: MemoryToolOptions): AnyAgentTool {

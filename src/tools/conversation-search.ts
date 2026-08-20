@@ -7,6 +7,8 @@ import { buildFtsQuery } from "../core/store/sqlite.js";
 import type { EmbeddingService } from "../core/store/embedding.js";
 import type { Logger } from "../core/types.js";
 import type { AnyAgentTool } from "openclaw/plugin-sdk/plugin-entry";
+import { rrfMerge } from "../core/search/rrf.js";
+import type { MemoryToolOptions } from "./common.js";
 
 export interface ConversationSearchResultItem {
   id: string;
@@ -22,28 +24,6 @@ export interface ConversationSearchResult {
   total: number;
   strategy: string;
   message?: string;
-}
-
-const TAG = "[memory-tdai][tdai_conversation_search]";
-const RRF_K = 60;
-
-function rrfMergeL0(...lists: ConversationSearchResultItem[][]): ConversationSearchResultItem[] {
-  const map = new Map<string, { item: ConversationSearchResultItem; rrfScore: number }>();
-  for (const list of lists) {
-    for (let rank = 0; rank < list.length; rank++) {
-      const item = list[rank];
-      const score = 1 / (RRF_K + rank + 1);
-      const existing = map.get(item.id);
-      if (existing) {
-        existing.rrfScore += score;
-      } else {
-        map.set(item.id, { item, rrfScore: score });
-      }
-    }
-  }
-  return [...map.values()]
-    .sort((a, b) => b.rrfScore - a.rrfScore)
-    .map(({ item, rrfScore }) => ({ ...item, score: rrfScore }));
 }
 
 export async function executeConversationSearch(params: {
@@ -132,7 +112,7 @@ export async function executeConversationSearch(params: {
 
   let results: ConversationSearchResultItem[];
   if (strategy === "hybrid") {
-    results = rrfMergeL0(ftsItems, vecItems);
+    results = rrfMerge(ftsItems, vecItems);
   } else {
     results = ftsOk ? ftsItems : vecItems;
   }
@@ -162,12 +142,6 @@ export function formatConversationSearchResponse(result: ConversationSearchResul
   }
 
   return lines.join("\n");
-}
-
-export interface MemoryToolOptions {
-  vectorStore?: IMemoryStore;
-  embeddingService?: EmbeddingService;
-  logger?: Logger;
 }
 
 export function createConversationSearchTool(options: MemoryToolOptions): AnyAgentTool {
