@@ -2,7 +2,7 @@
  * Simple OpenAI-compatible LLM runner for standalone usage.
  */
 
-import type { LLMRunner } from "./types.js";
+import type { LLMRunner } from "../types.js";
 
 export interface OpenAICompatibleRunnerOptions {
   baseUrl?: string;
