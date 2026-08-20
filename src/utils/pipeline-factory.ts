@@ -1,13 +1,13 @@
 /**
  * Pipeline factory: shared infrastructure for creating and wiring
  * MemoryPipelineManager instances with VectorStore, EmbeddingService,
- * L1 runner, L2 runner, L3 runner, and persister.
+ * L1 runner, L2 runner, and persister.
  *
  * Used by both:
  * - `index.ts` (live plugin runtime)
  * - `seed-runtime.ts` (standalone seed CLI command)
  *
- * This avoids duplicating VectorStore init, L1/L2/L3 extraction logic,
+ * This avoids duplicating VectorStore init, L1/L2 extraction logic,
  * persister wiring, and destroy sequences across multiple callers.
  */
 
@@ -15,7 +15,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { MemoryTdaiConfig } from "../config.js";
 import { MemoryPipelineManager } from "./pipeline-manager.js";
-import type { L2Runner, L3Runner } from "./pipeline-manager.js";
+import type { L2Runner } from "./pipeline-manager.js";
 import { SessionFilter } from "./session-filter.js";
 import { extractL1Memories } from "../core/record/l1-extractor.js";
 import { readConversationMessagesGroupedBySessionId } from "../core/conversation/l0-recorder.js";
@@ -33,8 +33,6 @@ import {
   type Manifest,
 } from "./manifest.js";
 import { SceneExtractor } from "../core/scene/scene-extractor.js";
-import { PersonaTrigger } from "../core/persona/persona-trigger.js";
-import { PersonaGenerator } from "../core/persona/persona-generator.js";
 import { pullProfilesToLocal, syncLocalProfilesToStore } from "../core/profile/profile-sync.js";
 import type { Logger } from "../core/types.js";
 
@@ -68,8 +66,6 @@ export interface PipelineFactoryOptions {
   sessionFilter?: SessionFilter;
   /** Host-neutral LLM runner for L1 extraction (text-only, enableTools=false). */
   l1LlmRunner?: import("../core/types.js").LLMRunner;
-  /** Host-neutral LLM runner for L2/L3 (tool-call enabled, enableTools=true). */
-  l2l3LlmRunner?: import("../core/types.js").LLMRunner;
 }
 
 // ============================
@@ -580,36 +576,6 @@ export function createL2Runner(opts: {
 }
 
 // ============================
-// L3 Runner factory
-// ============================
-
-/**
- * Create the L3 runner function.
- *
- * L3 persona generation is disabled in the L2/L3 redesign — L3 injection is
- * now performed by `auto-recall.ts` directly reading top-K recent scenes.
- * The runner body is a no-op that emits a debug log. PersonaGenerator and
- * PersonaTrigger imports are retained for backward compat with seed-runtime
- * callers and will be marked deprecated separately.
- */
-export function createL3Runner(opts: {
-  pluginDataDir: string;
-  cfg: MemoryTdaiConfig;
-  openclawConfig: unknown;
-  vectorStore?: IMemoryStore;
-  logger: PipelineLogger;
-  instanceId?: string;
-  /** Host-neutral LLM runner for L3 persona generation (standalone/gateway mode). Must have enableTools=true. */
-  llmRunner?: import("../core/types.js").LLMRunner;
-}): L3Runner {
-  const { pluginDataDir, cfg, openclawConfig, vectorStore, logger, instanceId, llmRunner } = opts;
-
-  return async () => {
-    logger.debug?.(`${TAG} [L3] Persona generation disabled (L2/L3 redesign)`);
-  };
-}
-
-// ============================
 // Pipeline Manager factory
 // ============================
 
@@ -647,8 +613,8 @@ export function createPipelineManager(
  * MemoryPipelineManager with L1 runner and persister attached.
  *
  * This is the high-level entry point used by both `index.ts` and `seed-runtime.ts`.
- * Callers should attach L2/L3 runners after creation using `createL2Runner()`
- * and `createL3Runner()` from this module.
+ * Callers should attach L2 runner after creation using `createL2Runner()`
+ * from this module.
  */
 export async function createPipeline(opts: PipelineFactoryOptions): Promise<PipelineInstance> {
   const { pluginDataDir, cfg, openclawConfig, logger, sessionFilter, l1LlmRunner } = opts;

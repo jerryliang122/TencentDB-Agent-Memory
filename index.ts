@@ -1,21 +1,12 @@
 /**
- * memory-tdai v3: Four-layer memory system plugin for OpenClaw.
+ * memory-tencentdb: Four-layer memory system plugin for OpenClaw.
  *
  * Provides:
- * - L0: Automatic conversation recording (local JSONL)
+ * - L0: Automatic conversation recording (SQLite)
  * - L1: Structured memory extraction (LLM + dedup)
  * - L2: Scene block management (LLM scene extraction)
- * - L3: Persona generation (LLM persona synthesis)
  *
  * All processing is local, zero external API dependencies.
- *
- * v3.1: Refactored to use TdaiCore + OpenClawHostAdapter.
- * index.ts is now a thin shell that:
- * - Registers tools and hooks with OpenClaw
- * - Translates OpenClaw events into TdaiCore calls
- * - Manages prompt caching and metric reporting
- *
- * Core memory logic lives in src/core/tdai-core.ts (host-neutral).
  */
 
 import path from "node:path";
@@ -23,7 +14,7 @@ import { createRequire } from "node:module";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { parseConfig } from "./src/config.js";
 import type { MemoryTdaiConfig } from "./src/config.js";
-import { initTimeModule, getActiveTimeZone } from "./src/utils/time.js";
+import { initTimeModule } from "./src/utils/time.js";
 import { registerOffload } from "./src/offload/index.js";
 import {
   setPreferredEmbeddedAgentRuntime,
@@ -32,47 +23,29 @@ import {
 import { SessionFilter } from "./src/utils/session-filter.js";
 import { LocalMemoryCleaner } from "./src/utils/memory-cleaner.js";
 import { registerMemoryTdaiCli } from "./src/cli/index.js";
-import { initDataDirectories, resetStores } from "./src/utils/pipeline-factory.js";
+import { initDataDirectories, resetStores, createPipeline } from "./src/utils/pipeline-factory.js";
 import { getOrCreateInstanceId, initReporter, report, resetReporter } from "./src/core/report/reporter.js";
 import { ensureL2L3Local } from "./src/core/profile/profile-sync.js";
-
-// Core abstractions (host-neutral)
-import { OpenClawHostAdapter } from "./src/adapters/openclaw/host-adapter.js";
-import { TdaiCore } from "./src/core/tdai-core.js";
-import { sanitizeToolError } from "./src/core/tools/memory-get.js";
+import { performAutoRecall } from "./src/core/hooks/auto-recall.js";
+import { performAutoCapture } from "./src/core/hooks/auto-capture.js";
 import {
   ensurePluginHookPolicy,
   decideHookPolicy,
 } from "./src/utils/ensure-hook-policy.js";
 import { resolveOpenClawStateDir } from "./src/utils/openclaw-state-dir.js";
+import { sanitizeToolError } from "./src/tools/memory-get.js";
+import type { IMemoryStore } from "./src/core/store/types.js";
+import type { EmbeddingService } from "./src/core/store/embedding.js";
+import type { MemoryPipelineManager } from "./src/utils/pipeline-manager.js";
+import type { Logger } from "./src/core/types.js";
+
+import { createMemorySearchTool, createMemoryGetTool, createConversationSearchTool } from "./src/tools/index.js";
 
 const TAG = "[memory-tdai]";
 
-/**
- * Epoch ms when the plugin was registered (cold-start timestamp).
- * Used as a fallback cursor in performAutoCapture when no checkpoint
- * exists yet — prevents the first agent_end from dumping the entire
- * session history into L0.
- */
 let pluginStartTimestamp = 0;
 
-/**
- * Cache original user prompts and message counts across hooks.
- * - text: clean user prompt before prependContext injection
- * - ts: cache creation time (for TTL sweep)
- * - messageCount: session message count at before_prompt_build time,
- *   used as fallback slice offset if timestamp cursor is unreliable
- */
 const pendingOriginalPrompts = new Map<string, { text: string; ts: number; messageCount: number }>();
-const PROMPT_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
-const PROMPT_CACHE_MAX_SIZE = 10_000; // Hard limit to prevent unbounded growth in high-concurrency scenarios
-
-/**
- * Cache recall results (L1 memories + L3 Persona) from before_prompt_build
- * for retrieval at agent_end, enabling the agent_turn metric event.
- *
- * Keyed by sessionKey — same correlation pattern as pendingOriginalPrompts.
- */
 const pendingRecallCache = new Map<string, {
   l1Memories: Array<{ content: string; score: number; type: string }>;
   l3Persona: string | null;
@@ -80,67 +53,32 @@ const pendingRecallCache = new Map<string, {
   durationMs: number;
   ts: number;
 }>();
-
-/**
- * Cache recall completion timestamps per session.
- * Used in agent_end to estimate LLM reasoning time:
- *   llmEstimatedMs ≈ agent_end_start - recall_end_ts
- * Entries are cleaned up in agent_end after use; stale entries swept alongside prompt cache.
- */
 const pendingRecallEndTimestamps = new Map<string, number>();
-
-/**
- * Pending `<relevant-memories>` text waiting to be persisted into the
- * current-turn user message via `before_message_write`.
- *
- * Populated by `before_prompt_build` (when `recall.persistToTranscript`
- * is enabled) and consumed exactly once by `before_message_write`.
- * Keyed by sessionKey.
- *
- * Why this exists: OpenClaw's `prependContext` is deliberately NOT
- * persisted to the transcript (see OpenClaw test
- * "keeps before_prompt_build context in the model prompt and out of
- * transcript messages"). That means on turn N+1 the previous user
- * message reverts to its bare form, busting the provider prompt cache
- * from the first user message onward. By persisting the memories here
- * instead, the model-facing prefix is byte-identical across turns and
- * the cache stays warm. The model reads the memories directly from
- * `session.messages` (no `prependContext` is returned, so
- * `installModelPromptTransform` is a no-op and does not override the
- * persisted content).
- */
 const pendingTranscriptInjection = new Map<string, { text: string; ts: number }>();
 
-// 进程级单例，避免同一进程重复启动清理器导致并发清理竞态
+const PROMPT_CACHE_TTL_MS = 10 * 60 * 1000;
+const PROMPT_CACHE_MAX_SIZE = 10_000;
+
 let sharedMemoryCleaner: LocalMemoryCleaner | undefined;
 
-/**
- * Sweep both pendingOriginalPrompts and pendingRecallCache for stale entries.
- * Unified from the original sweepStalePromptCache() to cover both Maps
- * with identical TTL + hard-cap logic.
- */
 function sweepStaleCaches(): void {
   const now = Date.now();
-  // Clean pendingOriginalPrompts
   for (const [key, entry] of pendingOriginalPrompts) {
     if (now - entry.ts > PROMPT_CACHE_TTL_MS) {
       pendingOriginalPrompts.delete(key);
       pendingRecallEndTimestamps.delete(key);
     }
   }
-  // Clean pendingRecallCache
   for (const [key, entry] of pendingRecallCache) {
     if (now - entry.ts > PROMPT_CACHE_TTL_MS) {
       pendingRecallCache.delete(key);
     }
   }
-  // Clean pendingTranscriptInjection (same TTL as prompt cache)
   for (const [key, entry] of pendingTranscriptInjection) {
     if (now - entry.ts > PROMPT_CACHE_TTL_MS) {
       pendingTranscriptInjection.delete(key);
     }
   }
-  // Hard limit: evict oldest entries if any Map exceeds cap
   if (pendingOriginalPrompts.size > PROMPT_CACHE_MAX_SIZE) {
     const entries = [...pendingOriginalPrompts.entries()].sort((a, b) => a[1].ts - b[1].ts);
     const toEvict = entries.slice(0, entries.length - PROMPT_CACHE_MAX_SIZE);
@@ -166,16 +104,12 @@ function sweepStaleCaches(): void {
 }
 
 export default function register(api: OpenClawPluginApi) {
-  // ─── CLI metadata mode: register CLI commands only, skip all runtime init ───
-  // In this mode, runtime is `{} as PluginRuntime` (empty object).
-  // OpenClaw calls this to discover CLI subcommands without starting the full plugin.
   if (api.registrationMode === "cli-metadata") {
     api.registerCli(
       ({ program, config, logger: cliLogger }) => {
         const memoryTdai = program
           .command("memory-tdai")
           .description("memory-tdai plugin commands (seed, query, stats)");
-
         registerMemoryTdaiCli(memoryTdai, {
           config,
           pluginConfig: api.pluginConfig,
@@ -188,81 +122,27 @@ export default function register(api: OpenClawPluginApi) {
     return;
   }
 
-  // ─── Full / discovery mode: complete runtime initialization ───
   pluginStartTimestamp = Date.now();
   setPreferredEmbeddedAgentRuntime(api.runtime.agent);
-  // Reset reporter singleton so config changes take effect on hot-reload.
   resetReporter();
   const _require = createRequire(import.meta.url);
   const pluginVersion = (() => { try { return (_require("./package.json") as { version?: string }).version ?? "unknown"; } catch { return "unknown"; } })();
-  api.logger.debug?.(
-    `${TAG} Registering plugin ... ` +
-    `startTimestamp=${pluginStartTimestamp} (${new Date(pluginStartTimestamp).toISOString()})`,
-  );
 
   let cfg: MemoryTdaiConfig;
   try {
-    // OpenClaw calls register() N times (plugin scan → gateway start →
-    // per-channel bootstrap → config reload). Each call receives the full
-    // pluginConfig from openclaw.json, so we parse it directly every time.
     const rawPluginConfig = api.pluginConfig as Record<string, unknown> | undefined;
-    const rawKeys = rawPluginConfig ? Object.keys(rawPluginConfig) : [];
-    api.logger.debug?.(
-      `${TAG} pluginConfig received (${rawKeys.length} keys)`,
-    );
-
     cfg = parseConfig(rawPluginConfig);
-    api.logger.debug?.(
-      `${TAG} Config parsed: ` +
-      `capture=${cfg.capture.enabled}, ` +
-      `recall=${cfg.recall.enabled}(maxResults=${cfg.recall.maxResults}), ` +
-      `extraction=${cfg.extraction.enabled}(dedup=${cfg.extraction.enableDedup}, maxMem=${cfg.extraction.maxMemoriesPerSession}), ` +
-      `pipeline=(everyN=${cfg.pipeline.everyNConversations}, warmup=${cfg.pipeline.enableWarmup}, l1Idle=${cfg.pipeline.l1IdleTimeoutSeconds}s, l2DelayAfterL1=${cfg.pipeline.l2DelayAfterL1Seconds}s, l2Min=${cfg.pipeline.l2MinIntervalSeconds}s, l2Max=${cfg.pipeline.l2MaxIntervalSeconds}s, activeWindow=${cfg.pipeline.sessionActiveWindowHours}h), ` +
-      `persona(triggerEvery=${cfg.persona.triggerEveryN}, backupCount=${cfg.persona.backupCount}, sceneBackupCount=${cfg.persona.sceneBackupCount}), ` +
-      `memoryCleanup(enabled=${cfg.memoryCleanup.enabled}, retentionDays=${cfg.memoryCleanup.retentionDays ?? "(disabled)"}, cleanTime=${cfg.memoryCleanup.cleanTime}), ` +
-      `offload(enabled=${cfg.offload.enabled}, backendUrl=${cfg.offload.backendUrl ?? "(none)"}, mildRatio=${cfg.offload.mildOffloadRatio}, aggressiveRatio=${cfg.offload.aggressiveCompressRatio}, retentionDays=${cfg.offload.offloadRetentionDays})`,
-    );
   } catch (err) {
     api.logger.error(`${TAG} Config parsing failed: ${err instanceof Error ? err.message : String(err)}`);
     throw err;
   }
 
-  // Initialize unified time module (must happen before any timestamp formatting)
   initTimeModule({ timezone: cfg.timezone }, api.logger);
 
-  // ============================
-  // Hook policy auto-patch (v2026.4.24+ compat)
-  // ============================
-  // `allowConversationAccess` hook policy was introduced in v2026.4.23;
-  // the zod schema fix landed in v2026.4.24. Older hosts don't understand
-  // the field and don't need it patched in.
-  //
-  // Note: `api.runtime.version` is only exposed on v2026.4.15+. On older
-  // hosts it is `undefined`; we MUST treat that as "does not need the
-  // patch" (old hosts have no gate), otherwise we would silently mutate
-  // the user's openclaw.json on every gateway start.
   {
-    // Gate: only apply the auto-patch when host version >= 2026.4.24.
-    // decideHookPolicy() parses the leading x.y.z prefix numerically
-    // (ignoring `-beta.N`, `-N`, etc.) and returns apply=false for any
-    // version we cannot parse — which is the safe default on old hosts
-    // that don't expose `api.runtime.version`. See ensure-hook-policy.ts
-    // for the full policy + co-located unit tests.
     const rawVersion = (api.runtime as any)?.version;
     const decision = decideHookPolicy(rawVersion);
-    const parsedStr = decision.parsedXYZ ? decision.parsedXYZ.join(".") : "<unparsable>";
-    const minStr = decision.minXYZ.join(".");
-
-    if (!decision.apply) {
-      api.logger.debug?.(
-        `${TAG} Hook policy auto-patch skipped: ` +
-        `original=${JSON.stringify(rawVersion)}, parsed=${parsedStr}, min=${minStr}`,
-      );
-    } else {
-      api.logger.debug?.(
-        `${TAG} Hook policy auto-patch applying: ` +
-        `original=${JSON.stringify(rawVersion)}, parsed=${parsedStr} >= min=${minStr}`,
-      );
+    if (decision.apply) {
       try {
         ensurePluginHookPolicy({
           rootConfig: api.config,
@@ -275,64 +155,54 @@ export default function register(api: OpenClawPluginApi) {
     }
   }
 
-  // If remote embedding config is incomplete, log a prominent error so the user knows
   if (cfg.embedding.configError) {
     api.logger.error(`${TAG} [EMBEDDING CONFIG ERROR] ${cfg.embedding.configError}`);
   }
 
-  // Resolve plugin data directory via runtime API (avoid importing internal paths directly)
   const openclawStateDir = resolveOpenClawStateDir((api.runtime as any)?.state);
   const pluginDataDir = path.join(openclawStateDir, "memory-tdai");
   initDataDirectories(pluginDataDir);
-  api.logger.debug?.(`${TAG} Data dir: ${pluginDataDir} (all subdirectories initialized)`);
-
-  // ============================
-  // Create OpenClawHostAdapter + TdaiCore
-  // ============================
-  const hostAdapter = new OpenClawHostAdapter({
-    api,
-    pluginDataDir,
-    openclawConfig: api.config,
-  });
 
   const sessionFilter = new SessionFilter(cfg.capture.excludeAgents);
-  if (cfg.capture.excludeAgents.length > 0) {
-    api.logger.debug?.(`${TAG} Agent exclude patterns: ${cfg.capture.excludeAgents.join(", ")}`);
-  }
 
-  const core = new TdaiCore({
-    hostAdapter,
-    config: cfg,
+  let vectorStore: IMemoryStore | undefined;
+  let embeddingService: EmbeddingService | undefined;
+  let scheduler: MemoryPipelineManager | undefined;
+  let pipelineDestroy: (() => Promise<void>) | undefined;
+  const bgTasks = new Set<Promise<void>>();
+
+  const coreReady = createPipeline({
+    pluginDataDir,
+    cfg,
+    openclawConfig: api.config,
+    logger: api.logger,
     sessionFilter,
-  });
+  }).then((pipeline) => {
+    vectorStore = pipeline.vectorStore;
+    embeddingService = pipeline.embeddingService;
+    scheduler = pipeline.scheduler;
+    pipelineDestroy = pipeline.destroy;
 
-  // Initialize TdaiCore (async — store init, pipeline wiring)
-  const coreReady = core.initialize().then(() => {
-    // Keep cleaner's SQLite handle updated after store init
-    memoryCleaner?.setVectorStore(core.getVectorStore());
-
-    // Pull L2/L3 profiles if remote store supports it
-    const vs = core.getVectorStore();
-    if (vs?.pullProfiles) {
-      ensureL2L3Local(pluginDataDir, vs, api.logger).catch((err) => {
-        api.logger.warn(`${TAG} Startup L2/L3 pull failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
-      });
+    if (vectorStore) {
+      memoryCleaner?.setVectorStore(vectorStore);
+      if (vectorStore.pullProfiles) {
+        ensureL2L3Local(pluginDataDir, vectorStore, api.logger).catch((err) => {
+          api.logger.warn(`${TAG} Startup L2/L3 pull failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+        });
+      }
     }
   }).catch((err) => {
-    api.logger.error(`${TAG} Core init failed: ${err instanceof Error ? err.message : String(err)}`);
+    api.logger.error(`${TAG} Pipeline init failed: ${err instanceof Error ? err.message : String(err)}`);
   });
 
-  // Kick off instanceId resolution immediately after data dir is ready.
   let instanceId: string | undefined;
   getOrCreateInstanceId(pluginDataDir).then((id) => {
     instanceId = id;
-    core.setInstanceId(id);
     initReporter({ enabled: cfg.report.enabled, type: cfg.report.type, logger: api.logger, instanceId: id, pluginVersion });
   }).catch((err) => {
     api.logger.warn(`${TAG} Failed to initialize instanceId for metrics: ${err instanceof Error ? err.message : String(err)}`);
   });
 
-  // Daily local JSONL cleaner (L0/L1), enabled only when retentionDays is configured.
   let memoryCleaner: LocalMemoryCleaner | undefined;
   if (cfg.memoryCleanup.enabled && cfg.memoryCleanup.retentionDays != null) {
     if (!sharedMemoryCleaner) {
@@ -345,13 +215,8 @@ export default function register(api: OpenClawPluginApi) {
         sceneCandidateTtlDays: cfg.persona.sceneCandidateTtlDays,
       });
       sharedMemoryCleaner.start();
-      api.logger.debug?.(`${TAG} Memory cleaner started (singleton)`);
-    } else {
-      api.logger.debug?.(`${TAG} Memory cleaner already started in this process, reusing existing instance`);
     }
     memoryCleaner = sharedMemoryCleaner;
-  } else {
-    api.logger.debug?.(`${TAG} Memory cleaner disabled (retentionDays not configured)`);
   }
 
   const resolveSessionKey = (sessionKey?: string): string | undefined => {
@@ -360,345 +225,76 @@ export default function register(api: OpenClawPluginApi) {
     return undefined;
   };
 
-  /**
-   * Whether embedding warmup has been triggered.
-   * Deferred until first real conversation to avoid model downloads during CLI commands.
-   */
   let embeddingWarmupTriggered = false;
   const ensureEmbeddingWarmup = (): void => {
-    const svc = core.getEmbeddingService();
-    if (!svc) return;
+    if (!embeddingService) return;
     if (!embeddingWarmupTriggered) {
       embeddingWarmupTriggered = true;
-      api.logger.debug?.(`${TAG} Triggering lazy embedding warmup on first conversation`);
-      svc.startWarmup();
+      embeddingService.startWarmup();
       return;
     }
-    if (!svc.isReady()) {
-      api.logger.debug?.(`${TAG} Embedding not ready, re-triggering warmup (retry)`);
-      svc.startWarmup();
+    if (!embeddingService.isReady()) {
+      embeddingService.startWarmup();
     }
   };
 
   // ============================
-  // Tool registration — delegate to TdaiCore
+  // Tool registration
   // ============================
-
-  // tdai_memory_search — Agent-callable L1 memory search tool
-  // TODO: implement hard per-turn call limit via before_tool_call hook + execute early-return (方案 D)
   if (cfg.recall.enabled || cfg.capture.enabled) {
-  api.registerTool(
-    {
-      name: "tdai_memory_search",
-      label: "Memory Search",
-      description:
-        "Search through the user's long-term memories. Use this when you need to recall specific information about the user's preferences, past events, instructions, or context from previous conversations. Returns relevant memory records ranked by relevance. " +
-        "Limit: tdai_memory_search and tdai_conversation_search share a combined limit of 3 calls per turn. Stop searching after 3 total attempts.",
-      parameters: {
-        type: "object",
-        properties: {
-          query: {
-            type: "string",
-            description: "Search query describing what you want to recall about the user",
-          },
-          limit: {
-            type: "number",
-            description: "Maximum number of results to return (default: 5, max: 20)",
-          },
-          type: {
-            type: "string",
-            enum: ["persona", "episodic", "instruction"],
-            description: "Optional filter by memory type: persona (identity/preferences), episodic (events/activities), instruction (user rules/commands)",
-          },
-          scene: {
-            type: "string",
-            description: "Optional filter by scene name",
-          },
-        },
-        required: ["query"],
-      },
-      async execute(_toolCallId: string, params: Record<string, unknown>) {
-        const startMs = Date.now();
-        const query = String(params.query ?? "");
-        const limit = Math.min(Math.max(Number(params.limit) || 5, 1), 20);
-        const typeFilter = typeof params.type === "string" ? params.type : undefined;
-        const sceneFilter = typeof params.scene === "string" ? params.scene : undefined;
+    const toolOptions = {
+      get vectorStore() { return vectorStore; },
+      get embeddingService() { return embeddingService; },
+      logger: api.logger,
+    };
 
-        api.logger.debug?.(
-          `${TAG} [tool] tdai_memory_search called: ` +
-          `query="${query.length > 80 ? query.slice(0, 80) + "…" : query}", ` +
-          `limit=${limit}, type=${typeFilter ?? "(all)"}, scene=${sceneFilter ?? "(all)"}`,
-        );
-
-        try {
-          const result = await core.searchMemories({ query, limit, type: typeFilter, scene: sceneFilter });
-
-          const elapsedMs = Date.now() - startMs;
-          api.logger.debug?.(
-            `${TAG} [tool] tdai_memory_search completed (${elapsedMs}ms): ` +
-            `total=${result.total}, strategy=${result.strategy}, ` +
-            `responseLength=${result.text.length} chars`,
-          );
-          report("tool_call", {
-            tool: "tdai_memory_search",
-            query, limit, typeFilter, sceneFilter,
-            resultCount: result.total,
-            strategy: result.strategy,
-            durationMs: elapsedMs,
-            success: true,
-          });
-          return {
-            content: [{ type: "text" as const, text: result.text }],
-            details: { count: result.total, strategy: result.strategy },
-          };
-        } catch (err) {
-          const elapsedMs = Date.now() - startMs;
-          const errMsg = err instanceof Error ? err.message : String(err);
-          api.logger.error(`${TAG} [tool] tdai_memory_search failed (${elapsedMs}ms): ${errMsg}`);
-          report("tool_call", {
-            tool: "tdai_memory_search",
-            query, limit, typeFilter, sceneFilter,
-            durationMs: elapsedMs,
-            success: false,
-            error: errMsg,
-          });
-          return {
-            content: [{ type: "text" as const, text: `Memory search failed: ${errMsg}` }],
-            details: { error: errMsg },
-          };
-        }
-      },
-    },
-    { name: "tdai_memory_search" },
-  );
-
-  // tdai_memory_get — Agent-callable single-record fetch tool (companion to
-  // subject-only auto-recall injection). When recall injects only the subject
-  // + hint + record_id into the prompt, the main agent uses this tool to
-  // fetch the full content of a specific memory on demand.
-  // TODO: implement hard per-turn call limit via before_tool_call hook + execute early-return (方案 D)
-  api.registerTool(
-    {
-      name: "tdai_memory_get",
-      label: "Memory Get",
-      description:
-        "Fetch the full content of a single memory record by its record_id. " +
-        "Use this when an auto-recalled memory subject (the [id=...] line in <relevant-memories>) " +
-        "looks relevant and you need the complete content to answer. " +
-        "Cheaper and more precise than tdai_memory_search when you already have a specific record_id. " +
-        "Limit: shares the per-turn 5-call budget with tdai_memory_search and tdai_conversation_search.",
-      parameters: {
-        type: "object",
-        properties: {
-          record_id: {
-            type: "string",
-            description: "The record_id from a recalled memory line, e.g. m_1785515129486_dee4cb6c",
-          },
-        },
-        required: ["record_id"],
-      },
-      async execute(_toolCallId: string, params: Record<string, unknown>) {
-        const startMs = Date.now();
-        const recordId = String(params.record_id ?? "").trim();
-
-        api.logger.debug?.(
-          `${TAG} [tool] tdai_memory_get called: record_id=${recordId || "(empty)"}`,
-        );
-
-        if (!recordId) {
-          const elapsedMs = Date.now() - startMs;
-          api.logger.warn?.(`${TAG} [tool] tdai_memory_get called with empty record_id (${elapsedMs}ms)`);
-          report("tool_call", {
-            tool: "tdai_memory_get",
-            recordId: "",
-            durationMs: elapsedMs,
-            success: false,
-            error: "empty record_id",
-          });
-          return {
-            content: [{ type: "text" as const, text: "record_id is required." }],
-            details: { error: "empty record_id" },
-          };
-        }
-
-        try {
-          const result = await core.getMemory(recordId);
-
-          const elapsedMs = Date.now() - startMs;
-          api.logger.debug?.(
-            `${TAG} [tool] tdai_memory_get completed (${elapsedMs}ms): ` +
-            `found=${result.found}, responseLength=${result.text.length} chars`,
-          );
-          report("tool_call", {
-            tool: "tdai_memory_get",
-            recordId,
-            found: result.found,
-            durationMs: elapsedMs,
-            success: true,
-          });
-          return {
-            content: [{ type: "text" as const, text: result.text }],
-            details: { found: result.found },
-          };
-        } catch (err) {
-          const elapsedMs = Date.now() - startMs;
-          // Sanitize error: the LLM agent must never see internal error
-          // details (SQL errors, file paths, stack traces). Full error is
-          // preserved in `internalError` for logs + telemetry only.
-          const { userMessage, errorCode, internalError } = sanitizeToolError(err);
-          api.logger.error(`${TAG} [tool] tdai_memory_get failed (${elapsedMs}ms): ${internalError}`);
-          report("tool_call", {
-            tool: "tdai_memory_get",
-            recordId,
-            durationMs: elapsedMs,
-            success: false,
-            error: internalError,
-          });
-          return {
-            content: [{ type: "text" as const, text: userMessage }],
-            details: { error: errorCode },
-          };
-        }
-      },
-    },
-    { name: "tdai_memory_get" },
-  );
-
-  // tdai_conversation_search — Agent-callable L0 conversation search tool
-  // TODO: implement hard per-turn call limit via before_tool_call hook + execute early-return (方案 D)
-  api.registerTool(
-    {
-      name: "tdai_conversation_search",
-      label: "Conversation Search",
-      description:
-        "Search through past conversation history (raw dialogue records). " +
-        "Use this when tdai_memory_search (structured memories) doesn't have the information you need, " +
-        "or when you want to find specific past conversations, dialogue context, or exact words " +
-        "the user said before. Returns relevant individual messages ranked by relevance. " +
-        "Limit: tdai_memory_search and tdai_conversation_search share a combined limit of 3 calls per turn. Stop searching after 3 total attempts.",
-      parameters: {
-        type: "object",
-        properties: {
-          query: {
-            type: "string",
-            description: "Search query describing what conversation content you want to find",
-          },
-          limit: {
-            type: "number",
-            description: "Maximum number of messages to return (default: 5, max: 20)",
-          },
-          session_key: {
-            type: "string",
-            description: "Optional: filter results to a specific session",
-          },
-        },
-        required: ["query"],
-      },
-      async execute(_toolCallId: string, params: Record<string, unknown>) {
-        const startMs = Date.now();
-        const query = String(params.query ?? "");
-        const limit = Math.min(Math.max(Number(params.limit) || 5, 1), 20);
-        const sessionKeyFilter = typeof params.session_key === "string" ? params.session_key : undefined;
-
-        api.logger.debug?.(
-          `${TAG} [tool] tdai_conversation_search called: ` +
-          `query="${query.length > 80 ? query.slice(0, 80) + "…" : query}", ` +
-          `limit=${limit}, session_key=${sessionKeyFilter ?? "(all)"}`,
-        );
-
-        try {
-          const result = await core.searchConversations({ query, limit, sessionKey: sessionKeyFilter });
-
-          const elapsedMs = Date.now() - startMs;
-          api.logger.debug?.(
-            `${TAG} [tool] tdai_conversation_search completed (${elapsedMs}ms): ` +
-            `total=${result.total}, responseLength=${result.text.length} chars`,
-          );
-          report("tool_call", {
-            tool: "tdai_conversation_search",
-            query, limit, sessionKeyFilter,
-            resultCount: result.total,
-            durationMs: elapsedMs,
-            success: true,
-          });
-          return {
-            content: [{ type: "text" as const, text: result.text }],
-            details: { count: result.total },
-          };
-        } catch (err) {
-          const elapsedMs = Date.now() - startMs;
-          const errMsg = err instanceof Error ? err.message : String(err);
-          api.logger.error(`${TAG} [tool] tdai_conversation_search failed (${elapsedMs}ms): ${errMsg}`);
-          report("tool_call", {
-            tool: "tdai_conversation_search",
-            query, limit, sessionKeyFilter,
-            durationMs: elapsedMs,
-            success: false,
-            error: errMsg,
-          });
-          return {
-            content: [{ type: "text" as const, text: `Conversation search failed: ${errMsg}` }],
-            details: { error: errMsg },
-          };
-        }
-      },
-    },
-    { name: "tdai_conversation_search" },
-  );
-  } else {
-    api.logger.debug?.(`${TAG} Memory tools (tdai_memory_search, tdai_conversation_search) not registered — memory features disabled`);
+    api.registerTool(() => createMemorySearchTool(toolOptions), { names: ["tdai_memory_search"] });
+    api.registerTool(() => createMemoryGetTool(toolOptions), { names: ["tdai_memory_get"] });
+    api.registerTool(() => createConversationSearchTool(toolOptions), { names: ["tdai_conversation_search"] });
   }
 
   // ============================
-  // Lifecycle hooks — delegate to TdaiCore
+  // Hooks
   // ============================
-
-  // Before prompt build: auto-recall relevant memories
   if (cfg.recall.enabled) {
-    api.logger.debug?.(`${TAG} Registering before_prompt_build hook (auto-recall)`);
     api.on("before_prompt_build", async (event, ctx) => {
       const startMs = Date.now();
-      api.logger.debug?.(`${TAG} [before_prompt_build] Hook triggered`);
-
       const sessionKey = ctx.sessionKey;
 
-      if (sessionFilter.shouldSkipCtx(ctx)) {
-        api.logger.debug?.(`${TAG} [before_prompt_build] Skipping filtered session`);
-        return;
-      }
+      if (sessionFilter.shouldSkipCtx(ctx)) return;
 
       ensureEmbeddingWarmup();
 
-      // Cache original user prompt for agent_end
       const rawPrompt = event.prompt;
       const messages = Array.isArray(event.messages) ? event.messages : undefined;
       if (sessionKey && rawPrompt) {
         const messageCount = messages?.length ?? 0;
         pendingOriginalPrompts.set(sessionKey, { text: rawPrompt, ts: Date.now(), messageCount });
-        api.logger.debug?.(`${TAG} [before_prompt_build] Cached original prompt (${rawPrompt.length} chars, msgCount=${messageCount})`);
       }
       sweepStaleCaches();
 
       const userText = rawPrompt;
-      api.logger.debug?.(`${TAG} [before_prompt_build] userText length: ${userText?.length}`);
-      if (!userText) {
-        api.logger.debug?.(`${TAG} [before_prompt_build] No user text found, skipping recall`);
-        return;
-      }
+      if (!userText) return;
 
       const resolvedSessionKey = resolveSessionKey(sessionKey);
-      if (!resolvedSessionKey) {
-        return;
-      }
+      if (!resolvedSessionKey) return;
 
       try {
         await coreReady;
         const recallStartMs = Date.now();
-        const result = await core.handleBeforeRecall(userText, resolvedSessionKey);
+        const result = await performAutoRecall({
+          userText,
+          actorId: ctx.agentId ?? "",
+          sessionKey: resolvedSessionKey,
+          cfg,
+          pluginDataDir,
+          logger: api.logger,
+          vectorStore,
+          embeddingService,
+        });
         const elapsedMs = Date.now() - startMs;
         const recallDurationMs = Date.now() - recallStartMs;
 
-        // Cache recall results for agent_turn metric (retrieved at agent_end)
         if (sessionKey && result) {
           pendingRecallCache.set(sessionKey, {
             l1Memories: result.recalledL1Memories ?? [],
@@ -709,111 +305,42 @@ export default function register(api: OpenClawPluginApi) {
           });
         }
 
-        // Record recall completion timestamp for LLM timing estimation in agent_end
         if (resolvedSessionKey) {
           pendingRecallEndTimestamps.set(resolvedSessionKey, Date.now());
         }
 
         if (result?.appendSystemContext || result?.prependContext) {
-          const appendLen = result.appendSystemContext?.length ?? 0;
-          const prependLen = result.prependContext?.length ?? 0;
-          api.logger.info(
-            `${TAG} [before_prompt_build] Recall complete (${elapsedMs}ms), ` +
-            `appendSystemContext=${appendLen} chars, prependContext=${prependLen} chars`,
-          );
-        } else {
-          api.logger.info(`${TAG} [before_prompt_build] Recall complete (${elapsedMs}ms), no context to inject`);
+          api.logger.info(`${TAG} [before_prompt_build] Recall complete (${elapsedMs}ms)`);
         }
 
-        // When persistToTranscript is enabled, hand the L1 prependContext to
-        // before_message_write so it gets written into the JSONL user message
-        // (keeping the model-facing prefix stable across turns for prompt
-        // caching) instead of returning it via OpenClaw's prependContext
-        // channel (which is intentionally not persisted and would bust the
-        // cache from the first user message onward on every subsequent turn).
         if (cfg.recall.persistToTranscript && sessionKey && result?.prependContext) {
-          pendingTranscriptInjection.set(sessionKey, {
-            text: result.prependContext,
-            ts: Date.now(),
-          });
-          api.logger.debug?.(
-            `${TAG} [before_prompt_build] Queued ${result.prependContext.length} chars of ` +
-            `prependContext for before_message_write (persistToTranscript=true)`,
-          );
-          // Return result without prependContext so OpenClaw does not
-          // double-inject via its own (non-persistent) prependContext path.
-          // appendSystemContext (active scenes, tools guide) is stable and
-          // remains in the system prompt where it is cacheable.
+          pendingTranscriptInjection.set(sessionKey, { text: result.prependContext, ts: Date.now() });
           return { ...result, prependContext: undefined };
         }
 
         return result;
       } catch (err) {
-        const elapsedMs = Date.now() - startMs;
-        api.logger.error(`${TAG} [before_prompt_build] Auto-recall failed after ${elapsedMs}ms: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
-        if (instanceId) {
-          report("error_degradation", {
-            module: "auto-recall",
-            action: "performAutoRecall",
-            errorType: "exception",
-            errorMessage: err instanceof Error ? err.message : String(err),
-            degradedTo: "no_recall",
-            impact: "non-blocking",
-          });
-        }
+        api.logger.error(`${TAG} [before_prompt_build] Auto-recall failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     });
   }
 
-  // Persist `<relevant-memories>` into the user message transcript (when
-  // `recall.persistToTranscript` is enabled) OR strip stale tags from
-  // historical messages (when disabled).
-  //
-  // persistToTranscript=true (default, cache-friendly):
-  //   before_prompt_build queues the recalled L1 memories here, and we
-  //   prepend them to the user message BEFORE it is written to JSONL.
-  //   The model reads them directly from session.messages (no
-  //   prependContext is returned, so installModelPromptTransform is a
-  //   no-op). Because the transcript now stores the exact bytes the
-  //   model saw, the provider prompt-cache prefix stays identical on
-  //   the next turn.
-  //
-  // persistToTranscript=false (legacy):
-  //   Strip <relevant-memories> tags from user messages before
-  //   persistence. This path is retained for users who cannot tolerate
-  //   recall artifacts in the transcript; it busts the prompt cache
-  //   every turn and is not recommended.
-  api.logger.debug?.(`${TAG} Registering before_message_write hook (persistToTranscript=${cfg.recall.persistToTranscript})`);
   api.on("before_message_write", (event, ctx) => {
     const msg = event.message as { role?: string; content?: unknown };
-    const contentType = typeof msg.content === "string" ? "string" : Array.isArray(msg.content) ? "parts" : typeof msg.content;
-    api.logger.debug?.(`${TAG} [before_message_write] role=${msg.role}, contentType=${contentType}`);
-
     if (msg.role !== "user") return;
 
     const sessionKey = ctx?.sessionKey;
 
     if (cfg.recall.persistToTranscript) {
-      // ── Inject mode: prepend queued <relevant-memories> into the
-      // current-turn user message so it is persisted to JSONL. ──
       if (!sessionKey) return;
       const pending = pendingTranscriptInjection.get(sessionKey);
       if (!pending) return;
-      // Consume exactly once - subsequent before_message_write calls for
-      // the same sessionKey (e.g. tool-result flushes, repair appends)
-      // must not re-inject.
       pendingTranscriptInjection.delete(sessionKey);
 
       const prependText = pending.text;
-      api.logger.debug?.(
-        `${TAG} [before_message_write] Injecting ${prependText.length} chars of ` +
-        `<relevant-memories> into user message (persistToTranscript=true)`,
-      );
-
       if (typeof msg.content === "string") {
-        if (msg.content.includes("<relevant-memories>")) return; // idempotent guard
-        const newContent = `${prependText}\n\n${msg.content}`;
-        return { message: { ...event.message, content: newContent } as typeof event.message };
+        if (msg.content.includes("<relevant-memories>")) return;
+        return { message: { ...event.message, content: `${prependText}\n\n${msg.content}` } as typeof event.message };
       }
 
       if (Array.isArray(msg.content)) {
@@ -831,14 +358,12 @@ export default function register(api: OpenClawPluginApi) {
       return;
     }
 
-    // ── Legacy strip mode (persistToTranscript=false). ──
     const STRIP_RE = /<relevant-memories>[\s\S]*?<\/relevant-memories>\s*/g;
 
     if (typeof msg.content === "string") {
       if (!msg.content.includes("<relevant-memories>")) return;
       const cleaned = msg.content.replace(STRIP_RE, "").trim();
       if (cleaned === msg.content) return;
-      api.logger.debug?.(`${TAG} [before_message_write] Stripped: ${msg.content.length} -> ${cleaned.length} chars`);
       return { message: { ...event.message, content: cleaned } as typeof event.message };
     }
 
@@ -852,78 +377,58 @@ export default function register(api: OpenClawPluginApi) {
         return { ...part, text: cleaned };
       });
       if (totalStripped === 0) return;
-      api.logger.debug?.(`${TAG} [before_message_write] Stripped from parts: removed ${totalStripped} chars`);
       return { message: { ...event.message, content: cleanedParts } as unknown as typeof event.message };
     }
   });
 
-  // After agent end: auto-capture + L0 record + L1/L2/L3 schedule
   if (cfg.capture.enabled) {
-    api.logger.debug?.(`${TAG} Registering agent_end hook (auto-capture)`);
     api.on("agent_end", async (event, ctx) => {
       const startMs = Date.now();
-      api.logger.debug?.(`${TAG} [agent_end] Hook triggered`);
-
       const e = event as Record<string, unknown>;
-      if (!e.success) {
-        api.logger.info(`${TAG} [agent_end] Agent did not succeed, skipping capture`);
-        return;
-      }
+      if (!e.success) return;
 
       const sessionKey = ctx.sessionKey;
       const sessionId = ctx.sessionId;
 
-      if (sessionFilter.shouldSkipCtx(ctx)) {
-        api.logger.debug?.(`${TAG} [agent_end] Skipping filtered session`);
-        return;
-      }
+      if (sessionFilter.shouldSkipCtx(ctx)) return;
 
       const messages = (e.messages as unknown[]) ?? [];
       const resolvedSessionKey = resolveSessionKey(sessionKey);
-      if (!resolvedSessionKey) {
-        return;
-      }
+      if (!resolvedSessionKey) return;
 
-      // Estimate LLM reasoning time: recallEnd → agentEnd start
       const recallEndTs = pendingRecallEndTimestamps.get(resolvedSessionKey);
       if (recallEndTs) {
-        const llmEstimatedMs = startMs - recallEndTs;
-        api.logger.info(
-          `${TAG} ⏱ Turn timing: recallEnd→agentEnd=${llmEstimatedMs}ms ` +
-          `(≈ LLM reasoning + prompt build + tool calls)`,
-        );
         pendingRecallEndTimestamps.delete(resolvedSessionKey);
       }
 
-      // Retrieve cached original prompt
       const cachedPrompt = sessionKey ? pendingOriginalPrompts.get(sessionKey) : undefined;
       const originalUserText = cachedPrompt?.text;
 
       try {
         await coreReady;
 
-        // Pre-warm the embedded agent on first conversation
-        if (!core.isSchedulerStarted()) {
+        if (scheduler && !scheduler.isDestroyed) {
           prewarmEmbeddedAgent(api.logger, api.runtime.agent);
         }
 
-        const captureResult = await core.handleTurnCommitted({
-          userText: originalUserText ?? "",
-          assistantText: "",
+        const captureResult = await performAutoCapture({
           messages,
           sessionKey: resolvedSessionKey,
           sessionId: sessionId || undefined,
-          startedAt: pluginStartTimestamp,
+          cfg,
+          pluginDataDir,
+          logger: api.logger,
+          scheduler,
+          originalUserText,
           originalUserMessageCount: cachedPrompt?.messageCount,
+          pluginStartTimestamp,
+          vectorStore,
+          embeddingService,
+          bgTaskRegistry: bgTasks,
         });
         const captureMs = Date.now() - startMs;
-        api.logger.info(
-          `${TAG} [agent_end] Auto-capture complete (${captureMs}ms), ` +
-          `l0Recorded=${captureResult.l0RecordedCount}, ` +
-          `schedulerNotified=${captureResult.schedulerNotified}`,
-        );
+        api.logger.info(`${TAG} [agent_end] Auto-capture complete (${captureMs}ms)`);
 
-        // ── agent_turn metric ──
         const cachedRecall = sessionKey ? pendingRecallCache.get(sessionKey) : undefined;
         if (sessionKey) pendingRecallCache.delete(sessionKey);
 
@@ -948,22 +453,10 @@ export default function register(api: OpenClawPluginApi) {
           });
         }
       } catch (err) {
-        const elapsedMs = Date.now() - startMs;
-        api.logger.error(`${TAG} [agent_end] Auto-capture failed after ${elapsedMs}ms: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
-        if (instanceId) {
-          report("error_degradation", {
-            module: "auto-capture",
-            action: "performAutoCapture",
-            errorType: "exception",
-            errorMessage: err instanceof Error ? err.message : String(err),
-            degradedTo: "no_capture",
-            impact: "non-blocking",
-          });
-        }
+        api.logger.error(`${TAG} [agent_end] Auto-capture failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     });
 
-    // gateway_stop: ordered shutdown via TdaiCore.destroy()
     api.on("gateway_stop", async () => {
       const GATEWAY_STOP_TIMEOUT_MS = 3_000;
       const hookStartMs = Date.now();
@@ -971,7 +464,6 @@ export default function register(api: OpenClawPluginApi) {
       await coreReady.catch(() => {});
 
       const doCleanup = async (): Promise<void> => {
-        // 1. Stop memory cleaner first
         if (memoryCleaner) {
           try {
             memoryCleaner.destroy();
@@ -983,79 +475,56 @@ export default function register(api: OpenClawPluginApi) {
           }
         }
 
-        // 2. Destroy TdaiCore (scheduler flush + VectorStore close + EmbeddingService close)
-        await core.destroy();
+        if (pipelineDestroy) {
+          await pipelineDestroy();
+        }
       };
 
-      // Race cleanup against a hard timeout
       let timeoutId: ReturnType<typeof setTimeout> | undefined;
       try {
         await Promise.race([
           doCleanup(),
           new Promise<never>((_, reject) => {
-            timeoutId = setTimeout(
-              () => reject(new Error("timeout")),
-              GATEWAY_STOP_TIMEOUT_MS,
-            );
+            timeoutId = setTimeout(() => reject(new Error("timeout")), GATEWAY_STOP_TIMEOUT_MS);
           }),
         ]);
       } catch (err) {
-        api.logger.warn(
-          `${TAG} [gateway_stop] Aborted (${Date.now() - hookStartMs}ms): ${err instanceof Error ? err.message : String(err)}. ` +
-          `Pending work will recover on next startup.`,
-        );
+        api.logger.warn(`${TAG} [gateway_stop] Aborted: ${err instanceof Error ? err.message : String(err)}`);
       } finally {
         if (timeoutId !== undefined) clearTimeout(timeoutId);
       }
 
       resetStores();
-      api.logger.info(`${TAG} [gateway_stop] Cleanup finished, all resources released (${Date.now() - hookStartMs}ms)`);
+      api.logger.info(`${TAG} [gateway_stop] Cleanup finished (${Date.now() - hookStartMs}ms)`);
     });
-  } else {
-    api.logger.debug?.(`${TAG} Auto-capture disabled`);
   }
 
-  // memoryCleaner gateway_stop for capture-enabled-but-extraction-disabled case
   if (memoryCleaner && !cfg.extraction.enabled) {
     api.on("gateway_stop", async () => {
-      const startMs = Date.now();
       try {
         memoryCleaner?.destroy();
         if (sharedMemoryCleaner === memoryCleaner) {
           sharedMemoryCleaner = undefined;
         }
-        api.logger.info(`${TAG} [gateway_stop] Memory cleaner destroyed (${Date.now() - startMs}ms)`);
       } catch (error) {
-        api.logger.error(`${TAG} [gateway_stop] Error during memory cleaner destruction (${Date.now() - startMs}ms): ${error instanceof Error ? error.message : String(error)}`);
+        api.logger.error(`${TAG} [gateway_stop] Memory cleaner destruction error: ${error instanceof Error ? error.message : String(error)}`);
       }
     });
   }
 
-  // ============================
-  // Context Offload (conditional)
-  // ============================
   if (cfg.offload.enabled) {
-    api.logger.debug?.(`${TAG} Offload enabled, registering offload module...`);
     try {
       registerOffload(api, cfg.offload);
-      api.logger.debug?.(`${TAG} Offload module registered successfully`);
     } catch (err) {
       api.logger.error(`${TAG} Offload module registration failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-  } else {
-    api.logger.debug?.(`${TAG} Offload disabled (offload.enabled=false)`);
   }
-
-  // ============================
-  // CLI registration
-  // ============================
 
   api.registerCli(
     ({ program, config, logger: cliLogger }) => {
       const memoryTdai = program
         .command("memory-tdai")
         .description("memory-tdai plugin commands (seed, query, stats)");
-
       registerMemoryTdaiCli(memoryTdai, {
         config,
         pluginConfig: api.pluginConfig,
@@ -1064,10 +533,5 @@ export default function register(api: OpenClawPluginApi) {
       });
     },
     { commands: ["memory-tdai"] },
-  );
-
-  api.logger.debug?.(
-    `${TAG} Plugin registration complete (v3.1 — TdaiCore). ` +
-    `startTimestamp=${pluginStartTimestamp} (${new Date(pluginStartTimestamp).toISOString()})`,
   );
 }

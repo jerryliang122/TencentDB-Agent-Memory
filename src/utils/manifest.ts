@@ -15,26 +15,14 @@
 import fs from "node:fs";
 import path from "node:path";
 
-// ============================
-// Types
-// ============================
-
 export interface ManifestStoreInfo {
-  type: "sqlite" | "tcvdb";
+  type: "sqlite";
   sqlite?: {
-    /** Relative path to the SQLite DB file (relative to dataDir). */
     path: string;
-  };
-  tcvdb?: {
-    url: string;
-    database: string;
-    /** User-friendly alias (optional). */
-    alias?: string;
   };
 }
 
 export interface ManifestSeedInfo {
-  /** Original input file name (basename only). */
   inputFile?: string;
   sessions: number;
   rounds: number;
@@ -44,19 +32,11 @@ export interface ManifestSeedInfo {
 }
 
 export interface Manifest {
-  /** Schema version for future migrations. */
   version: 1;
-  /** Timestamp when the manifest was first created. */
   createdAt: string;
-  /** Store binding — written once on first init. */
   store: ManifestStoreInfo;
-  /** Seed run info — null for live-runtime directories. */
   seed: ManifestSeedInfo | null;
 }
-
-// ============================
-// Paths
-// ============================
 
 const METADATA_DIR = ".metadata";
 const MANIFEST_FILE = "manifest.json";
@@ -65,13 +45,6 @@ export function manifestPath(dataDir: string): string {
   return path.join(dataDir, METADATA_DIR, MANIFEST_FILE);
 }
 
-// ============================
-// Read / Write
-// ============================
-
-/**
- * Read an existing manifest from disk. Returns `null` if not found or unparseable.
- */
 export function readManifest(dataDir: string): Manifest | null {
   const p = manifestPath(dataDir);
   try {
@@ -83,9 +56,6 @@ export function readManifest(dataDir: string): Manifest | null {
   }
 }
 
-/**
- * Write a manifest to disk (creates `.metadata/` if needed).
- */
 export function writeManifest(dataDir: string, manifest: Manifest): void {
   const dir = path.join(dataDir, METADATA_DIR);
   fs.mkdirSync(dir, { recursive: true });
@@ -96,39 +66,18 @@ export function writeManifest(dataDir: string, manifest: Manifest): void {
   );
 }
 
-// ============================
-// Store binding helpers
-// ============================
-
 export interface StoreConfigSnapshot {
-  type: "sqlite" | "tcvdb";
+  type: "sqlite";
   sqlitePath?: string;
-  tcvdbUrl?: string;
-  tcvdbDatabase?: string;
-  tcvdbAlias?: string;
 }
 
-/**
- * Build a ManifestStoreInfo from the current store config snapshot.
- */
 export function buildStoreInfo(snapshot: StoreConfigSnapshot): ManifestStoreInfo {
-  const info: ManifestStoreInfo = { type: snapshot.type };
-  if (snapshot.type === "sqlite") {
-    info.sqlite = { path: snapshot.sqlitePath ?? "vectors.db" };
-  } else {
-    info.tcvdb = {
-      url: snapshot.tcvdbUrl!,
-      database: snapshot.tcvdbDatabase!,
-      alias: snapshot.tcvdbAlias || undefined,
-    };
-  }
-  return info;
+  return {
+    type: snapshot.type,
+    sqlite: { path: snapshot.sqlitePath ?? "vectors.db" },
+  };
 }
 
-/**
- * Compare the persisted store binding against the current config.
- * Returns a list of human-readable mismatch descriptions (empty = all good).
- */
 export function diffStoreBinding(
   persisted: ManifestStoreInfo,
   current: ManifestStoreInfo,
@@ -137,22 +86,11 @@ export function diffStoreBinding(
 
   if (persisted.type !== current.type) {
     diffs.push(`store type changed: ${persisted.type} → ${current.type}`);
-    return diffs; // no point comparing fields across different types
+    return diffs;
   }
 
-  if (persisted.type === "sqlite" && current.type === "sqlite") {
-    if (persisted.sqlite?.path !== current.sqlite?.path) {
-      diffs.push(`sqlite path changed: ${persisted.sqlite?.path} → ${current.sqlite?.path}`);
-    }
-  }
-
-  if (persisted.type === "tcvdb" && current.type === "tcvdb") {
-    if (persisted.tcvdb?.url !== current.tcvdb?.url) {
-      diffs.push(`tcvdb url changed: ${persisted.tcvdb?.url} → ${current.tcvdb?.url}`);
-    }
-    if (persisted.tcvdb?.database !== current.tcvdb?.database) {
-      diffs.push(`tcvdb database changed: ${persisted.tcvdb?.database} → ${current.tcvdb?.database}`);
-    }
+  if (persisted.sqlite?.path !== current.sqlite?.path) {
+    diffs.push(`sqlite path changed: ${persisted.sqlite?.path} → ${current.sqlite?.path}`);
   }
 
   return diffs;

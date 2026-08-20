@@ -235,29 +235,6 @@ export interface BM25Config {
   language: "zh" | "en";
 }
 
-/** Tencent Cloud VectorDB configuration. */
-export interface TcvdbConfig {
-  /** Instance URL (e.g. "http://10.0.1.1:80" or external domain) */
-  url: string;
-  /** Account name (default: "root") */
-  username: string;
-  /** API Key */
-  apiKey: string;
-  /** Database name (auto-generated from instance_id if empty) */
-  database: string;
-  /** User-friendly alias for this database (optional, for identification in database.json) */
-  alias: string;
-  /** Built-in embedding model (default: "bge-large-zh") */
-  embeddingModel: string;
-  /** Request timeout in ms (default: 10000) */
-  timeout: number;
-  /** Path to CA certificate PEM file (for HTTPS connections) */
-  caPemPath?: string;
-}
-
-/** Storage backend type. */
-export type StoreBackend = "sqlite" | "tcvdb";
-
 /** Report settings — controls metric/event reporting. */
 export interface ReportConfig {
   /** Enable reporting (default: false) */
@@ -386,10 +363,6 @@ export interface MemoryTdaiConfig {
   pipeline: PipelineTriggerConfig;
   recall: RecallConfig;
   embedding: EmbeddingConfig;
-  /** Storage backend: "sqlite" (default) or "tcvdb" */
-  storeBackend: StoreBackend;
-  /** Tencent Cloud VectorDB configuration (required when storeBackend = "tcvdb") */
-  tcvdb: TcvdbConfig;
   /** BM25 sparse vector encoding (local @tencentdb-agent-memory/tcvdb-text) */
   bm25: BM25Config;
   /** Local JSONL cleanup settings */
@@ -534,13 +507,6 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
   // --- BM25 (local @tencentdb-agent-memory/tcvdb-text encoder) ---
   const bm25Group = obj(c, "bm25");
 
-  // --- Store backend ---
-  const storeBackendRaw = str(c, "storeBackend") ?? "sqlite";
-  const storeBackend: StoreBackend = storeBackendRaw === "tcvdb" ? "tcvdb" : "sqlite";
-
-  // --- TCVDB config ---
-  const tcvdbGroup = obj(c, "tcvdb");
-
   const memoryCleanup: MemoryCleanupConfig = {
     retentionDays,
     enabled: retentionDays != null,
@@ -647,17 +613,6 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       captureTimeoutMs: num(embeddingGroup, "captureTimeoutMs") ?? undefined,
       modelCacheDir: optStr(embeddingGroup, "modelCacheDir"),
       configError: embeddingConfigError,
-    },
-    storeBackend,
-    tcvdb: {
-      url: str(tcvdbGroup, "url") ?? "",
-      username: str(tcvdbGroup, "username") ?? "root",
-      apiKey: str(tcvdbGroup, "apiKey") ?? "",
-      database: str(tcvdbGroup, "database") ?? "",
-      alias: str(tcvdbGroup, "alias") ?? "",
-      embeddingModel: str(tcvdbGroup, "embeddingModel") ?? "bge-large-zh",
-      timeout: num(tcvdbGroup, "timeout") ?? 10000,
-      caPemPath: str(tcvdbGroup, "caPemPath") || undefined,
     },
     bm25: {
       enabled: bool(bm25Group, "enabled") ?? true,
