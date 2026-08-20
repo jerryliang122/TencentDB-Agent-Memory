@@ -1,29 +1,28 @@
 /**
- * Seed runtime: L0→L1→L2→L3 orchestration for the `seed` command.
+ * Seed runtime: L0→L1→L2 orchestration for the `seed` command.
  *
  * Uses the shared pipeline-factory for VectorStore/EmbeddingService init,
- * L1 runner, L2 runner, L3 runner, and persister wiring — keeping this
+ * L1 runner, L2 runner, and persister wiring — keeping this
  * module focused on seed-specific concerns:
  * - Synchronous per-round L0 capture with progress reporting
  * - waitForL1Idle polling (L1 only — see FIXME below)
  * - Ctrl+C graceful shutdown
  *
  * FIXME: Currently we only wait for L1 to become idle before destroying the
- * pipeline.  L2 (scene extraction) and L3 (persona generation) may still be
- * in-flight when `pipeline.destroy()` is called.  This is intentional for now
- * to avoid excessively long seed runs, but means seed output may not include
- * the latest L2/L3 artifacts.  Re-evaluate adding a full L1+L2+L3 idle wait
- * once pipeline-manager exposes reliable L2/L3 idle signals.
+ * pipeline.  L2 (scene extraction) may still be in-flight when
+ * `pipeline.destroy()` is called.  This is intentional for now to avoid
+ * excessively long seed runs, but means seed output may not include
+ * the latest L2 artifacts.  Re-evaluate adding a full L1+L2 idle wait
+ * once pipeline-manager exposes reliable L2 idle signals.
  */
 
 import path from "node:path";
 import { parseConfig } from "../../config.js";
 import type { MemoryTdaiConfig } from "../../config.js";
 import { performAutoCapture } from "../hooks/auto-capture.js";
-import { createPipeline, createL2Runner, createL3Runner } from "../../utils/pipeline-factory.js";
+import { createPipeline, createL2Runner } from "../../utils/pipeline-factory.js";
 import type { PipelineInstance, PipelineLogger } from "../../utils/pipeline-factory.js";
 import { readManifest, writeManifest } from "../../utils/manifest.js";
-import { StandaloneLLMRunnerFactory } from "../../adapters/standalone/llm-runner.js";
 import type { MemoryPipelineManager } from "../../utils/pipeline-manager.js";
 import type { LLMRunner } from "../types.js";
 import type {
@@ -58,7 +57,7 @@ export interface SeedRuntimeOptions {
 // ============================
 
 /**
- * Create a seed pipeline using the shared factory, with L2/L3 runners
+ * Create a seed pipeline using the shared factory, with L2 runner
  * wired via shared factory functions (same logic as index.ts live runtime).
  */
 async function createSeedPipeline(opts: SeedRuntimeOptions): Promise<{ pipeline: PipelineInstance; cfg: MemoryTdaiConfig }> {
@@ -77,22 +76,26 @@ async function createSeedPipeline(opts: SeedRuntimeOptions): Promise<{ pipeline:
   // Seed always runs outside OpenClaw, so it needs standalone runners
   // unless an explicit openclawConfig is provided (rare).
   let l1LlmRunner: LLMRunner | undefined;
-  let l2l3LlmRunner: LLMRunner | undefined;
+  let l2LlmRunner: LLMRunner | undefined;
 
   if (cfg.llm.enabled && cfg.llm.apiKey) {
-    const runnerFactory = new StandaloneLLMRunnerFactory({
-      config: {
-        baseUrl: cfg.llm.baseUrl,
-        apiKey: cfg.llm.apiKey,
-        model: cfg.llm.model,
-        maxTokens: cfg.llm.maxTokens,
-        timeoutMs: cfg.llm.timeoutMs,
-        disableThinking: cfg.llm.disableThinking,
-      },
-      logger,
+    const { createOpenAICompatibleRunner } = await import("../utils/openai-runner.js");
+    l1LlmRunner = createOpenAICompatibleRunner({
+      baseUrl: cfg.llm.baseUrl,
+      apiKey: cfg.llm.apiKey,
+      model: cfg.llm.model,
+      maxTokens: cfg.llm.maxTokens,
+      timeoutMs: cfg.llm.timeoutMs,
+      enableTools: false,
     });
-    l1LlmRunner = runnerFactory.createRunner({ enableTools: false });
-    l2l3LlmRunner = runnerFactory.createRunner({ enableTools: true });
+    l2LlmRunner = createOpenAICompatibleRunner({
+      baseUrl: cfg.llm.baseUrl,
+      apiKey: cfg.llm.apiKey,
+      model: cfg.llm.model,
+      maxTokens: cfg.llm.maxTokens,
+      timeoutMs: cfg.llm.timeoutMs,
+      enableTools: true,
+    });
     logger.info(`${TAG} Seed using standalone LLM: model=${cfg.llm.model}`);
   }
 
@@ -112,17 +115,7 @@ async function createSeedPipeline(opts: SeedRuntimeOptions): Promise<{ pipeline:
     openclawConfig,
     vectorStore: pipeline.vectorStore,
     logger,
-    llmRunner: l2l3LlmRunner,
-  }));
-
-  // Wire L3 runner via shared factory (same logic as index.ts live runtime)
-  pipeline.scheduler.setL3Runner(createL3Runner({
-    pluginDataDir: outputDir,
-    cfg,
-    openclawConfig,
-    vectorStore: pipeline.vectorStore,
-    logger,
-    llmRunner: l2l3LlmRunner,
+    llmRunner: l2LlmRunner,
   }));
 
   return { pipeline, cfg };
