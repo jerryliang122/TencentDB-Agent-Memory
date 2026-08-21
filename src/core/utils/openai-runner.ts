@@ -12,7 +12,6 @@ export interface OpenAICompatibleRunnerOptions {
   model: string;
   maxTokens?: number;
   timeoutMs?: number;
-  enableTools?: boolean;
   disableThinking?: DisableThinkingStrategy;
 }
 
@@ -21,12 +20,11 @@ export function createOpenAICompatibleRunner(opts: OpenAICompatibleRunnerOptions
   const model = opts.model;
   const defaultMaxTokens = opts.maxTokens ?? 4096;
   const defaultTimeoutMs = opts.timeoutMs ?? 60000;
-  const enableTools = opts.enableTools ?? false;
   const disableThinking = opts.disableThinking ?? false;
 
   const noThinkFetch = disableThinking
-    ? createNoThinkFetch({ strategy: disableThinking })
-    : null;
+    ? createNoThinkFetch(disableThinking)
+    : undefined;
 
   return {
     async run(params: LLMRunParams): Promise<string> {
