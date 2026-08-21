@@ -219,9 +219,8 @@ export interface ProfileSyncRecord extends ProfileRecord {
 /**
  * Unified memory store interface.
  *
- * Implementations:
+ * Implementation:
  * - `SqliteMemoryStore` (sqlite.ts) — local SQLite + sqlite-vec + FTS5
- * - `TcvdbMemoryStore` (tcvdb.ts) — Tencent Cloud VectorDB (future)
  *
  * All methods are fault-tolerant: they return empty results or `false` on
  * failure rather than throwing, unless explicitly documented otherwise.

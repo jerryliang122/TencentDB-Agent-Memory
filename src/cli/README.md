@@ -4,7 +4,7 @@
 
 ## seed — 导入历史对话数据
 
-将历史对话 JSON 文件导入到记忆管线中，完整执行 L0→L1→L2→L3 流程。适用于：
+将历史对话 JSON 文件导入到记忆管线中，完整执行 L0→L1→L2 流程。适用于：
 
 - 将已有对话数据灌入记忆系统
 - 批量测试记忆提取效果
@@ -122,22 +122,6 @@ openclaw memory-tdai seed --input data.json --config seed-config.json --strict-r
 }
 ```
 
-如果需要 seed 到独立的 TCVDB 数据库：
-
-```json
-{
-  "storeBackend": "tcvdb",
-  "tcvdb": {
-    "database": "my_seed_test_db"
-  },
-  "pipeline": {
-    "everyNConversations": 3,
-    "enableWarmup": false,
-    "l1IdleTimeoutSeconds": 2
-  }
-}
-```
-
 ### 输出目录结构
 
 ```
@@ -145,7 +129,7 @@ openclaw memory-tdai seed --input data.json --config seed-config.json --strict-r
 ├── conversations/          — L0 JSONL 文件
 ├── records/                — L1 JSONL 文件
 ├── scene_blocks/           — L2 场景块
-├── vectors.db              — SQLite 向量数据库（仅 sqlite 后端）
+├── vectors.db              — SQLite 向量数据库
 ├── .metadata/
 │   ├── manifest.json       — 元数据（store 绑定 + seed 运行记录）
 │   └── checkpoint.json     — 管线进度

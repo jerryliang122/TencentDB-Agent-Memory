@@ -1,6 +1,6 @@
 # TencentDB Agent Memory
 
-OpenClaw/Hermes 插件，提供四层 AI 代理记忆（L0 对话 → L1 记录 → L2 场景 → L3 人设）。
+OpenClaw/Hermes 插件，提供三层 AI 代理记忆（L0 对话 → L1 记录 → L2 场景）。
 
 ## 命令
 
@@ -26,18 +26,24 @@ openclaw gateway restart       # 代码修改后重启生效
 
 ```
 index.ts              # 插件入口（OpenClaw hooks + tools）
-src/core/tdai-core.ts # 宿主无关的核心记忆逻辑
-src/adapters/         # 宿主适配器
 src/core/
   conversation/       # L0 — 原始对话捕获
   record/             # L1 — 结构化记忆提取
   scene/              # L2 — 场景摘要
-  persona/            # L3 — 用户画像生成
+  hooks/              # Auto-recall / auto-capture hooks
+  search/             # RRF merge 等搜索工具
+src/tools/            # 懒加载工具模块
+  memory-search.ts    # tdai_memory_search
+  memory-get.ts       # tdai_memory_get
+  conversation-search.ts # tdai_conversation_search
+src/utils/
+  pipeline-factory.ts # Pipeline 创建工厂
+  pipeline-manager.ts # L1/L2 调度管理
 src/offload/          # 上下文压缩（Mermaid 画布）
 hermes-plugin/        # Hermes agent 集成
 ```
 
-**模式**: `TdaiCore`（宿主无关）+ `HostAdapter`（OpenClaw 或 standalone）。新功能放入 `src/core/`，适配器将宿主事件转换为 core 调用。
+**模式**: 入口点直接使用 `createPipeline()`, `performAutoRecall()`, `performAutoCapture()` 等 factory 函数，通过 `api.registerTool()` 注册工具。
 
 ## 测试
 
@@ -54,7 +60,7 @@ git commit -s -m "feat(scope): 描述"
 ```
 
 类型: `feat`, `fix`, `docs`, `perf`, `refactor`, `test`, `chore`
-范围: `store`, `hooks`, `persona`, `scene`, `record`, `conversation`, `gateway`, `hermes`
+范围: `store`, `hooks`, `scene`, `record`, `conversation`, `hermes`
 
 ## 关键文件
 
