@@ -2,7 +2,9 @@
  * Simple OpenAI-compatible LLM runner for standalone usage.
  */
 
-import type { LLMRunner } from "../types.js";
+import type { LLMRunner, LLMRunParams } from "../types.js";
+import type { DisableThinkingStrategy } from "../../utils/no-think-fetch.js";
+import { createNoThinkFetch } from "../../utils/no-think-fetch.js";
 
 export interface OpenAICompatibleRunnerOptions {
   baseUrl?: string;
@@ -11,22 +13,32 @@ export interface OpenAICompatibleRunnerOptions {
   maxTokens?: number;
   timeoutMs?: number;
   enableTools?: boolean;
+  disableThinking?: DisableThinkingStrategy;
 }
 
 export function createOpenAICompatibleRunner(opts: OpenAICompatibleRunnerOptions): LLMRunner {
   const baseUrl = opts.baseUrl ?? "https://api.openai.com/v1";
   const model = opts.model;
-  const maxTokens = opts.maxTokens ?? 4096;
-  const timeoutMs = opts.timeoutMs ?? 60000;
+  const defaultMaxTokens = opts.maxTokens ?? 4096;
+  const defaultTimeoutMs = opts.timeoutMs ?? 60000;
   const enableTools = opts.enableTools ?? false;
+  const disableThinking = opts.disableThinking ?? false;
+
+  const noThinkFetch = disableThinking
+    ? createNoThinkFetch({ strategy: disableThinking })
+    : null;
 
   return {
-    async run(params) {
-      const messages = params.messages.map((m) => ({
-        role: m.role,
-        content: m.content,
-        ...(m.name ? { name: m.name } : {}),
-      }));
+    async run(params: LLMRunParams): Promise<string> {
+      const messages: Array<{ role: string; content: string }> = [];
+
+      if (params.systemPrompt) {
+        messages.push({ role: "system", content: params.systemPrompt });
+      }
+      messages.push({ role: "user", content: params.prompt });
+
+      const maxTokens = params.maxTokens ?? defaultMaxTokens;
+      const timeoutMs = params.timeoutMs ?? defaultTimeoutMs;
 
       const body: Record<string, unknown> = {
         model,
@@ -34,15 +46,12 @@ export function createOpenAICompatibleRunner(opts: OpenAICompatibleRunnerOptions
         max_tokens: maxTokens,
       };
 
-      if (params.tools && enableTools) {
-        body.tools = params.tools;
-      }
-
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
       try {
-        const response = await fetch(`${baseUrl}/chat/completions`, {
+        const fetchFn = noThinkFetch ?? fetch;
+        const response = await fetchFn(`${baseUrl}/chat/completions`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -62,10 +71,6 @@ export function createOpenAICompatibleRunner(opts: OpenAICompatibleRunnerOptions
             message: {
               role: string;
               content?: string;
-              tool_calls?: Array<{
-                id: string;
-                function: { name: string; arguments: string };
-              }>;
             };
           }>;
         };
@@ -75,15 +80,7 @@ export function createOpenAICompatibleRunner(opts: OpenAICompatibleRunnerOptions
           throw new Error("No choices in LLM response");
         }
 
-        return {
-          role: choice.message.role as "assistant",
-          content: choice.message.content ?? "",
-          toolCalls: choice.message.tool_calls?.map((tc) => ({
-            id: tc.id,
-            name: tc.function.name,
-            args: JSON.parse(tc.function.arguments),
-          })),
-        };
+        return choice.message.content ?? "";
       } finally {
         clearTimeout(timeoutId);
       }

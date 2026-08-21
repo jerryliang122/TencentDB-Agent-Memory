@@ -71,9 +71,9 @@ export async function performAutoCapture(params: {
    * capture (currently: deferred L0 embedding for SQLite-style stores).
    *
    * When provided, each background task's Promise is added to the set
-   * on creation and removed on completion.  This lets the owning
-   * ``TdaiCore`` instance await all pending background work before
-   * closing ``vectorStore`` / ``embeddingService`` in ``destroy()``,
+   * on creation and removed on completion.  This lets the plugin's
+   * gateway_stop handler await all pending background work before
+   * closing ``vectorStore`` / ``embeddingService``,
    * so we never hit an already-closed DB connection with a late
    * ``updateL0Embedding`` call.
    *
@@ -246,8 +246,8 @@ export async function performAutoCapture(params: {
 
       // Do NOT await — runs in background after response is sent.
       //
-      // Register the task in bgTaskRegistry (if provided) so TdaiCore.destroy()
-      // can await it before closing vectorStore / embeddingService.  The
+      // Register the task in bgTaskRegistry (if provided) so the plugin's
+      // gateway_stop handler can await it before closing vectorStore / embeddingService.  The
       // ``.finally`` clean-up ensures the entry is removed on both success
       // and failure; without that the set would leak and eventually block
       // shutdown indefinitely.

@@ -191,7 +191,7 @@ async function _doInitStores(
       embeddingService = undefined;
     } else {
       logger.debug?.(
-        `${TAG} Store initialized: backend=${cfg.storeBackend}, provider=${cfg.embedding.provider}`,
+        `${TAG} Store initialized: backend=sqlite, provider=${cfg.embedding.provider}`,
       );
       needsReindex = initResult.needsReindex;
       reindexReason = initResult.reason;
