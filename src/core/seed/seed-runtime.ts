@@ -80,21 +80,30 @@ async function createSeedPipeline(opts: SeedRuntimeOptions): Promise<{ pipeline:
 
   if (cfg.llm.enabled && cfg.llm.apiKey) {
     const { createOpenAICompatibleRunner } = await import("../utils/openai-runner.js");
+    const { StandaloneLLMRunner } = await import("../utils/standalone-llm-runner.js");
+    
+    // L1: simple text runner (no tools needed)
     l1LlmRunner = createOpenAICompatibleRunner({
       baseUrl: cfg.llm.baseUrl,
       apiKey: cfg.llm.apiKey,
       model: cfg.llm.model,
       maxTokens: cfg.llm.maxTokens,
       timeoutMs: cfg.llm.timeoutMs,
-      enableTools: false,
+      disableThinking: cfg.llm.disableThinking,
     });
-    l2LlmRunner = createOpenAICompatibleRunner({
-      baseUrl: cfg.llm.baseUrl,
-      apiKey: cfg.llm.apiKey,
-      model: cfg.llm.model,
-      maxTokens: cfg.llm.maxTokens,
-      timeoutMs: cfg.llm.timeoutMs,
+    
+    // L2: full runner with tool-call support for scene extraction
+    l2LlmRunner = new StandaloneLLMRunner({
+      config: {
+        baseUrl: cfg.llm.baseUrl,
+        apiKey: cfg.llm.apiKey,
+        model: cfg.llm.model,
+        maxTokens: cfg.llm.maxTokens,
+        timeoutMs: cfg.llm.timeoutMs,
+        disableThinking: cfg.llm.disableThinking,
+      },
       enableTools: true,
+      logger,
     });
     logger.info(`${TAG} Seed using standalone LLM: model=${cfg.llm.model}`);
   }
