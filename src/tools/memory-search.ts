@@ -8,6 +8,7 @@ import type { EmbeddingService } from "../core/store/embedding.js";
 import type { Logger } from "../core/types.js";
 import type { AnyAgentTool } from "openclaw/plugin-sdk/plugin-entry";
 import { rrfMerge } from "../core/search/rrf.js";
+import { report } from "../core/report/reporter.js";
 import type { MemoryToolOptions } from "./common.js";
 
 export interface MemorySearchResultItem {
@@ -168,10 +169,12 @@ export function createMemorySearchTool(options: MemoryToolOptions): AnyAgentTool
       required: ["query"],
     },
     async execute(_toolCallId, params) {
-      const query = String(params.query ?? "");
-      const limit = Math.min(Math.max(Number(params.limit) || 5, 1), 20);
-      const typeFilter = typeof params.type === "string" ? params.type : undefined;
-      const sceneFilter = typeof params.scene === "string" ? params.scene : undefined;
+      const startMs = Date.now();
+      const p = params as Record<string, unknown>;
+      const query = String(p.query ?? "");
+      const limit = Math.min(Math.max(Number(p.limit) || 5, 1), 20);
+      const typeFilter = typeof p.type === "string" ? p.type : undefined;
+      const sceneFilter = typeof p.scene === "string" ? p.scene : undefined;
 
       try {
         const result = await executeMemorySearch({
@@ -183,12 +186,33 @@ export function createMemorySearchTool(options: MemoryToolOptions): AnyAgentTool
           embeddingService: options.embeddingService,
           logger: options.logger,
         });
+        report("tool_call", {
+          tool: "tdai_memory_search",
+          query,
+          limit,
+          typeFilter,
+          sceneFilter,
+          resultCount: result.total,
+          strategy: result.strategy,
+          durationMs: Date.now() - startMs,
+          success: true,
+        });
         return {
           content: [{ type: "text", text: formatSearchResponse(result) }],
           details: { count: result.total, strategy: result.strategy },
         };
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
+        report("tool_call", {
+          tool: "tdai_memory_search",
+          query,
+          limit,
+          typeFilter,
+          sceneFilter,
+          durationMs: Date.now() - startMs,
+          success: false,
+          error: errMsg,
+        });
         return {
           content: [{ type: "text", text: `Memory search failed: ${errMsg}` }],
           details: { error: errMsg },

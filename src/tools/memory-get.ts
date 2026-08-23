@@ -5,6 +5,7 @@
 import type { IMemoryStore, L1RecordRow } from "../core/store/types.js";
 import type { Logger } from "../core/types.js";
 import type { AnyAgentTool } from "openclaw/plugin-sdk/plugin-entry";
+import { report } from "../core/report/reporter.js";
 import type { MemoryToolOptions } from "./common.js";
 
 export interface MemoryGetResult {
@@ -127,7 +128,9 @@ export function createMemoryGetTool(options: MemoryToolOptions): AnyAgentTool {
       required: ["record_id"],
     },
     async execute(_toolCallId, params) {
-      const recordId = String(params.record_id ?? "");
+      const startMs = Date.now();
+      const p = params as Record<string, unknown>;
+      const recordId = String(p.record_id ?? "");
 
       try {
         const result = await executeMemoryGet({
@@ -135,15 +138,31 @@ export function createMemoryGetTool(options: MemoryToolOptions): AnyAgentTool {
           vectorStore: options.vectorStore,
           logger: options.logger,
         });
+        report("tool_call", {
+          tool: "tdai_memory_get",
+          recordId,
+          found: result.found,
+          durationMs: Date.now() - startMs,
+          success: true,
+        });
         return {
           content: [{ type: "text", text: formatMemoryGetResponse(result) }],
           details: { found: result.found },
         };
       } catch (err) {
         const sanitized = sanitizeToolError(err);
+        report("tool_call", {
+          tool: "tdai_memory_get",
+          recordId,
+          durationMs: Date.now() - startMs,
+          success: false,
+          error: sanitized.internalError,
+        });
         return {
           content: [{ type: "text", text: sanitized.userMessage }],
-          details: { error: sanitized.internalError },
+          // details is agent-visible: expose only the generic error code.
+          // sanitized.internalError (SQL messages, paths) is for logs only.
+          details: { errorCode: sanitized.errorCode },
         };
       }
     },

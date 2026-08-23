@@ -9,6 +9,7 @@ interface RawL1Entry {
   summary?: string;
   tool_call_id?: string;
   timestamp?: string;
+  result_ref?: string;
   score?: number;
 }
 
@@ -32,6 +33,7 @@ export function parseL1Response(raw: string): OffloadEntry[] {
       tool_call: item.tool_call ?? "",
       summary: item.summary ?? "",
       timestamp: item.timestamp ?? "",
+      result_ref: item.result_ref ?? "",
       score: typeof item.score === "number" ? item.score : 5,
       node_id: null,
     });

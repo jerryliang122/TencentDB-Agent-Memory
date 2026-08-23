@@ -4,7 +4,7 @@ import {
   isValidDisableThinkingStrategy,
   normalizeDisableThinking,
   type DisableThinkingStrategy,
-} from "./no-think-fetch";
+} from "./no-think-fetch.js";
 
 /**
  * Capture the (input, init) passed through to the real global fetch so we can
