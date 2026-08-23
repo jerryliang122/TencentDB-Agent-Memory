@@ -1444,6 +1444,40 @@ export class VectorStore implements IMemoryStore {
     }
   }
 
+  /**
+   * Fetch stored L1 embedding vectors by record id (used by L2 scene
+   * routing). Records without a vector (metadata-only writes, legacy zero
+   * vectors) are returned with `embedding: null`.
+   *
+   * **Fault-tolerant**: returns `[]` on error, never throws.
+   */
+  getL1Embeddings(recordIds: string[]): Array<{ record_id: string; embedding: Float32Array | null }> {
+    if (this.degraded || !this.vecTablesReady || recordIds.length === 0) return [];
+    try {
+      const chunks: string[][] = [];
+      for (let i = 0; i < recordIds.length; i += 500) {
+        chunks.push(recordIds.slice(i, i + 500));
+      }
+      const out: Array<{ record_id: string; embedding: Float32Array | null }> = [];
+      for (const chunk of chunks) {
+        const placeholders = chunk.map(() => "?").join(",");
+        const rows = this.db
+          .prepare(`SELECT record_id, embedding FROM l1_vec WHERE record_id IN (${placeholders})`)
+          .all(...chunk) as Array<{ record_id: string; embedding: Uint8Array | Buffer | null }>;
+        for (const row of rows) {
+          const vec = row.embedding ? new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4) : null;
+          out.push({ record_id: row.record_id, embedding: vec && vec.some(v => v !== 0) ? vec : null });
+        }
+      }
+      return out;
+    } catch (err) {
+      this.logger?.warn?.(
+        `${TAG} [L1-embeddings] FAILED (non-fatal, returning []): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return [];
+    }
+  }
+
   // ── L0 operations ──────────────────────────────────
 
   /**

@@ -190,10 +190,10 @@ export interface StoreCapabilities {
 }
 
 // ============================
-// L2/L3 Profile Sync Types
+// L2 Profile Sync Types
 // ============================
 
-/** Canonical L2/L3 profile row shared between local cache and remote store. */
+/** Canonical L2 profile row shared between local cache and remote store. */
 export interface ProfileRecord {
   /** Stable ID: `profile:v1:${sha256(scope + "\0" + type + "\0" + filename)}`. */
   id: string;
@@ -276,6 +276,16 @@ export interface IMemoryStore {
    *          response without try/catch noise.
    */
   getL1ById(recordId: string): MaybePromise<L1RecordRow | null>;
+
+  /**
+   * Fetch stored embedding vectors for L1 records by id (used by L2 scene
+   * routing — avoids re-embedding memories whose vectors already exist).
+   *
+   * @returns One entry per found record; `embedding` is null for records
+   *          without a usable vector. Empty array on error. Optional —
+   *          callers fall back to embeddingService when absent.
+   */
+  getL1Embeddings?(recordIds: string[]): MaybePromise<Array<{ record_id: string; embedding: Float32Array | null }>>;
 
   // ── L1 Search ────────────────────────────────────────────
 

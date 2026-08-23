@@ -45,15 +45,12 @@ openclaw plugins install --link .
 │   ├── conversation/        # L0 对话层 — 原始对话捕获
 │   ├── record/              # L1 记录层 — 结构化信息提取
 │   ├── scene/               # L2 场景层 — 场景归纳与聚合
-│   ├── persona/             # L3 画像层 — 用户画像构建
 │   ├── store/               # 存储层 — SQLite/向量数据库
 │   ├── hooks/               # OpenClaw 钩子集成
 │   ├── prompts/             # LLM 提示词模板
 │   ├── tools/               # 工具函数
 │   ├── utils/               # 通用工具
 │   └── report/              # 健康检测与报告
-├── hermes-plugin/           # Hermes 智能体插件适配
-├── scripts/                 # 辅助脚本（Gateway 控制等）
 ├── CHANGELOG.md             # 变更日志
 └── README.md                # 项目说明
 ```

@@ -1,5 +1,5 @@
 /**
- * memory-tencentdb: Four-layer memory system plugin for OpenClaw.
+ * memory-tencentdb: Three-layer memory system plugin for OpenClaw.
  *
  * Provides:
  * - L0: Automatic conversation recording (SQLite)
@@ -11,21 +11,21 @@
 
 import path from "node:path";
 import { createRequire } from "node:module";
+import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { parseConfig } from "./src/config.js";
 import type { MemoryTdaiConfig } from "./src/config.js";
 import { initTimeModule } from "./src/utils/time.js";
 import { registerOffload } from "./src/offload/index.js";
 import {
-  setPreferredEmbeddedAgentRuntime,
-  prewarmEmbeddedAgent,
+  setPreferredPluginRuntime,
+  type PluginRuntimeLike,
 } from "./src/utils/clean-context-runner.js";
 import { SessionFilter } from "./src/utils/session-filter.js";
 import { LocalMemoryCleaner } from "./src/utils/memory-cleaner.js";
-import { registerMemoryTdaiCli } from "./src/cli/index.js";
 import { initDataDirectories, resetStores, createPipeline } from "./src/utils/pipeline-factory.js";
 import { getOrCreateInstanceId, initReporter, report, resetReporter } from "./src/core/report/reporter.js";
-import { ensureL2L3Local } from "./src/core/profile/profile-sync.js";
+import { ensureL2ProfilesLocal } from "./src/core/profile/profile-sync.js";
 import { performAutoRecall } from "./src/core/hooks/auto-recall.js";
 import { performAutoCapture } from "./src/core/hooks/auto-capture.js";
 import {
@@ -47,7 +47,6 @@ let pluginStartTimestamp = 0;
 const pendingOriginalPrompts = new Map<string, { text: string; ts: number; messageCount: number }>();
 const pendingRecallCache = new Map<string, {
   l1Memories: Array<{ content: string; score: number; type: string }>;
-  l3Persona: string | null;
   strategy: string;
   durationMs: number;
   ts: number;
@@ -102,27 +101,18 @@ function sweepStaleCaches(): void {
   }
 }
 
-export default function register(api: OpenClawPluginApi) {
+export default definePluginEntry({
+  id: "memory-tencentdb",
+  name: "Memory (TencentDB)",
+  description: "Three-layer memory system — auto-captures, structures, and summarizes conversational knowledge using local LLM + SQLite vector search",
+
+  register(api: OpenClawPluginApi) {
   if (api.registrationMode === "cli-metadata") {
-    api.registerCli(
-      ({ program, config, logger: cliLogger }) => {
-        const memoryTdai = program
-          .command("memory-tdai")
-          .description("memory-tdai plugin commands (seed, query, stats)");
-        registerMemoryTdaiCli(memoryTdai, {
-          config,
-          pluginConfig: api.pluginConfig,
-          stateDir: resolveOpenClawStateDir((api.runtime as any)?.state),
-          logger: cliLogger,
-        });
-      },
-      { commands: ["memory-tdai"] },
-    );
     return;
   }
 
   pluginStartTimestamp = Date.now();
-  setPreferredEmbeddedAgentRuntime(api.runtime.agent);
+  setPreferredPluginRuntime(api.runtime as unknown as PluginRuntimeLike);
   resetReporter();
   const _require = createRequire(import.meta.url);
   const pluginVersion = (() => { try { return (_require("./package.json") as { version?: string }).version ?? "unknown"; } catch { return "unknown"; } })();
@@ -170,12 +160,14 @@ export default function register(api: OpenClawPluginApi) {
   let pipelineDestroy: (() => Promise<void>) | undefined;
   const bgTasks = new Set<Promise<void>>();
 
+  let instanceId: string | undefined;
   const coreReady = createPipeline({
     pluginDataDir,
     cfg,
     openclawConfig: api.config,
     logger: api.logger,
     sessionFilter,
+    getInstanceId: () => instanceId,
   }).then((pipeline) => {
     vectorStore = pipeline.vectorStore;
     embeddingService = pipeline.embeddingService;
@@ -185,8 +177,8 @@ export default function register(api: OpenClawPluginApi) {
     if (vectorStore) {
       memoryCleaner?.setVectorStore(vectorStore);
       if (vectorStore.pullProfiles) {
-        ensureL2L3Local(pluginDataDir, vectorStore, api.logger).catch((err) => {
-          api.logger.warn(`${TAG} Startup L2/L3 pull failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+        ensureL2ProfilesLocal(pluginDataDir, vectorStore, api.logger).catch((err) => {
+          api.logger.warn(`${TAG} Startup L2 profile pull failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
         });
       }
     }
@@ -194,7 +186,6 @@ export default function register(api: OpenClawPluginApi) {
     api.logger.error(`${TAG} Pipeline init failed: ${err instanceof Error ? err.message : String(err)}`);
   });
 
-  let instanceId: string | undefined;
   getOrCreateInstanceId(pluginDataDir).then((id) => {
     instanceId = id;
     initReporter({ enabled: cfg.report.enabled, type: cfg.report.type, logger: api.logger, instanceId: id, pluginVersion });
@@ -297,7 +288,6 @@ export default function register(api: OpenClawPluginApi) {
         if (sessionKey && result) {
           pendingRecallCache.set(sessionKey, {
             l1Memories: result.recalledL1Memories ?? [],
-            l3Persona: result.recalledL3Persona ?? null,
             strategy: result.recallStrategy ?? "unknown",
             durationMs: recallDurationMs,
             ts: Date.now(),
@@ -406,10 +396,6 @@ export default function register(api: OpenClawPluginApi) {
       try {
         await coreReady;
 
-        if (scheduler && !scheduler.isDestroyed) {
-          prewarmEmbeddedAgent(api.logger, api.runtime.agent);
-        }
-
         const captureResult = await performAutoCapture({
           messages,
           sessionKey: resolvedSessionKey,
@@ -437,7 +423,6 @@ export default function register(api: OpenClawPluginApi) {
             userPrompt: originalUserText ?? null,
             recalledL1Memories: cachedRecall?.l1Memories ?? [],
             recalledL1Count: cachedRecall?.l1Memories?.length ?? 0,
-            recalledL3Persona: cachedRecall?.l3Persona ?? null,
             recallStrategy: cachedRecall?.strategy ?? null,
             recallDurationMs: cachedRecall?.durationMs ?? 0,
             l0CapturedMessages: captureResult.filteredMessages.map((m) => ({
@@ -455,61 +440,51 @@ export default function register(api: OpenClawPluginApi) {
         api.logger.error(`${TAG} [agent_end] Auto-capture failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     });
+  }
 
-    api.on("gateway_stop", async () => {
-      const GATEWAY_STOP_TIMEOUT_MS = 3_000;
-      const hookStartMs = Date.now();
+  // Shutdown cleanup must run regardless of capture/recall config: the
+  // pipeline (SQLite store, embedding service) is created whenever recall or
+  // capture is active, and needs explicit teardown on gateway stop.
+  api.on("gateway_stop", async () => {
+    const GATEWAY_STOP_TIMEOUT_MS = 3_000;
+    const hookStartMs = Date.now();
 
-      await coreReady.catch(() => {});
+    await coreReady.catch(() => {});
 
-      const doCleanup = async (): Promise<void> => {
-        if (memoryCleaner) {
-          try {
-            memoryCleaner.destroy();
-            if (sharedMemoryCleaner === memoryCleaner) {
-              sharedMemoryCleaner = undefined;
-            }
-          } catch (error) {
-            api.logger.error(`${TAG} [gateway_stop] memoryCleaner error: ${error instanceof Error ? error.message : String(error)}`);
+    const doCleanup = async (): Promise<void> => {
+      if (memoryCleaner) {
+        try {
+          memoryCleaner.destroy();
+          if (sharedMemoryCleaner === memoryCleaner) {
+            sharedMemoryCleaner = undefined;
           }
+        } catch (error) {
+          api.logger.error(`${TAG} [gateway_stop] memoryCleaner error: ${error instanceof Error ? error.message : String(error)}`);
         }
-
-        if (pipelineDestroy) {
-          await pipelineDestroy();
-        }
-      };
-
-      let timeoutId: ReturnType<typeof setTimeout> | undefined;
-      try {
-        await Promise.race([
-          doCleanup(),
-          new Promise<never>((_, reject) => {
-            timeoutId = setTimeout(() => reject(new Error("timeout")), GATEWAY_STOP_TIMEOUT_MS);
-          }),
-        ]);
-      } catch (err) {
-        api.logger.warn(`${TAG} [gateway_stop] Aborted: ${err instanceof Error ? err.message : String(err)}`);
-      } finally {
-        if (timeoutId !== undefined) clearTimeout(timeoutId);
       }
 
-      resetStores();
-      api.logger.info(`${TAG} [gateway_stop] Cleanup finished (${Date.now() - hookStartMs}ms)`);
-    });
-  }
-
-  if (memoryCleaner && !cfg.extraction.enabled) {
-    api.on("gateway_stop", async () => {
-      try {
-        memoryCleaner?.destroy();
-        if (sharedMemoryCleaner === memoryCleaner) {
-          sharedMemoryCleaner = undefined;
-        }
-      } catch (error) {
-        api.logger.error(`${TAG} [gateway_stop] Memory cleaner destruction error: ${error instanceof Error ? error.message : String(error)}`);
+      if (pipelineDestroy) {
+        await pipelineDestroy();
       }
-    });
-  }
+    };
+
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        doCleanup(),
+        new Promise<never>((_, reject) => {
+          timeoutId = setTimeout(() => reject(new Error("timeout")), GATEWAY_STOP_TIMEOUT_MS);
+        }),
+      ]);
+    } catch (err) {
+      api.logger.warn(`${TAG} [gateway_stop] Aborted: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      if (timeoutId !== undefined) clearTimeout(timeoutId);
+    }
+
+    resetStores();
+    api.logger.info(`${TAG} [gateway_stop] Cleanup finished (${Date.now() - hookStartMs}ms)`);
+  });
 
   if (cfg.offload.enabled) {
     try {
@@ -518,19 +493,5 @@ export default function register(api: OpenClawPluginApi) {
       api.logger.error(`${TAG} Offload module registration failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
-
-  api.registerCli(
-    ({ program, config, logger: cliLogger }) => {
-      const memoryTdai = program
-        .command("memory-tdai")
-        .description("memory-tdai plugin commands (seed, query, stats)");
-      registerMemoryTdaiCli(memoryTdai, {
-        config,
-        pluginConfig: api.pluginConfig,
-        stateDir: openclawStateDir,
-        logger: cliLogger,
-      });
-    },
-    { commands: ["memory-tdai"] },
-  );
-}
+  },
+});

@@ -1,11 +1,11 @@
 /**
  * auto-capture hook (v3): records conversation messages locally (L0),
- * then notifies the MemoryPipelineManager for L1/L2/L3 scheduling.
+ * then notifies the MemoryPipelineManager for L1/L2 scheduling.
  *
  * Key design decisions:
  * - Always write L0 locally via l0-recorder.
  * - When VectorStore + EmbeddingService are available, also write L0 vector index.
- * - Notify MemoryPipelineManager for L1/L2/L3 trigger evaluation.
+ * - Notify MemoryPipelineManager for L1/L2 trigger evaluation.
  * - L1 Runner reads from VectorStore DB (primary) or L0 JSONL files (fallback).
  * - Extraction is NOT triggered here. The pipeline manager decides when.
  */

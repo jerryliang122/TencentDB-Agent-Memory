@@ -1,6 +1,6 @@
 /**
  * Persona Generation Prompt — instructs LLM to generate/update user persona
- * using the four-layer deep scan model.
+ * using the three-layer deep scan model.
  *
  * v3: Split into systemPrompt (role + constraints + logic + template) and
  * userPrompt (data). Tool names aligned to OpenClaw actual API (write/edit).
