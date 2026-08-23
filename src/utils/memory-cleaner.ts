@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import type { IMemoryStore } from "../core/store/types.js";
-import { parseSceneBlock } from "../core/scene/scene-format.js";
+import { parseSceneFileV2 } from "../core/scene/scene-format.js";
 import { syncSceneIndex } from "../core/scene/scene-index.js";
 import { ManagedTimer } from "./managed-timer.js";
 import type { Logger } from "../core/types.js";
@@ -297,7 +297,6 @@ export class LocalMemoryCleaner {
 
   private async cleanupSceneBlocks(sceneTtlDays: number, nowMs: number): Promise<void> {
     const SCENE_DIR_NAME = "scene_blocks";
-    const MIN_RETAIN_SCENES = 3;
     const sceneDir = path.join(this.opts.baseDir, SCENE_DIR_NAME);
     const expiredDir = path.join(this.opts.baseDir, ".backup", "scene_blocks_expired");
     const cutoffMs = nowMs - sceneTtlDays * 86_400_000;
@@ -311,23 +310,23 @@ export class LocalMemoryCleaner {
       return;
     }
 
-    type SceneInfo = { filename: string; updatedMs: number; heat: number; ageKnown: boolean };
+    type SceneInfo = { filename: string; lastActiveMs: number; ageKnown: boolean };
     const scenes: SceneInfo[] = [];
     for (const file of files) {
       try {
         const raw = await fs.readFile(path.join(sceneDir, file), "utf-8");
-        const block = parseSceneBlock(raw, file);
-        const parsedMs = Date.parse(block.meta.updated);
+        const block = parseSceneFileV2(raw);
+        if (!block) continue; // legacy file awaiting v2 migration — skip
+        const parsedMs = Date.parse(block.meta.last_active || block.meta.updated);
         const ageKnown = Number.isFinite(parsedMs);
         if (!ageKnown) {
           this.opts.logger?.warn?.(
-            `${TAG} L2 cleanup: ${file} has unparseable META.updated="${block.meta.updated}" — skipping (safer than deleting based on coerced age)`,
+            `${TAG} L2 cleanup: ${file} has unparseable last_active="${block.meta.last_active}" — skipping (safer than deleting based on coerced age)`,
           );
         }
         scenes.push({
           filename: file,
-          updatedMs: ageKnown ? parsedMs : 0,
-          heat: block.meta.heat,
+          lastActiveMs: ageKnown ? parsedMs : 0,
           ageKnown,
         });
       } catch {
@@ -335,21 +334,9 @@ export class LocalMemoryCleaner {
       }
     }
 
-    const byHeat = [...scenes].sort((a, b) => b.heat - a.heat);
-    const protectedFilenames = new Set(byHeat.slice(0, MIN_RETAIN_SCENES).map((s) => s.filename));
-
-    // Only delete scenes with a known, parseable updated timestamp that is past TTL.
+    // Only archive scenes with a known, parseable last_active that is past TTL.
     // Scenes with unparseable timestamps are preserved (can't age them safely).
-    const expired = scenes.filter(
-      (s) => s.ageKnown && !protectedFilenames.has(s.filename) && s.updatedMs < cutoffMs,
-    );
-
-    const skippedUnknownAge = scenes.filter((s) => !s.ageKnown).length;
-    if (skippedUnknownAge > 0) {
-      this.opts.logger?.info?.(
-        `${TAG} L2 cleanup: preserved ${skippedUnknownAge} scene(s) with unparseable updated timestamp`,
-      );
-    }
+    const expired = scenes.filter((s) => s.ageKnown && s.lastActiveMs < cutoffMs);
 
     if (expired.length === 0) {
       this.opts.logger?.debug?.(`${TAG} L2 cleanup: no expired scenes`);
@@ -357,14 +344,14 @@ export class LocalMemoryCleaner {
     }
 
     await fs.mkdir(expiredDir, { recursive: true });
-    let deleted = 0;
+    let archived = 0;
     for (const s of expired) {
       const src = path.join(sceneDir, s.filename);
       const dst = path.join(expiredDir, s.filename);
       try {
         await fs.copyFile(src, dst);
         await fs.unlink(src);
-        deleted++;
+        archived++;
       } catch (err) {
         this.opts.logger?.warn?.(
           `${TAG} L2 cleanup: failed to remove ${s.filename}: ${
@@ -375,7 +362,7 @@ export class LocalMemoryCleaner {
     }
 
     this.opts.logger?.info?.(
-      `${TAG} L2 cleanup: removed ${deleted} expired scenes (retention=${sceneTtlDays}d, retained ${scenes.length - deleted}/${scenes.length})`,
+      `${TAG} L2 cleanup: archived ${archived} expired scenes (ttl=${sceneTtlDays}d, retained ${scenes.length - archived}/${scenes.length})`,
     );
 
     try {
@@ -392,7 +379,7 @@ export class LocalMemoryCleaner {
   /**
    * Prune expired entries from the scene candidate pool.
    *
-   * Candidates that haven't been observed (no new PROPOSE_CANDIDATE signal)
+   * Candidates with no new routed memory within ttlDays
    * for `ttlDays` are removed from `.metadata/scene_candidates.json` so dead
    * topics don't accumulate forever. The pool file is rewritten only when at
    * least one entry was pruned (avoids touching the file on every tick when

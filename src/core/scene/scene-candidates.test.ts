@@ -4,11 +4,11 @@ import path from "node:path";
 import os from "node:os";
 import { SceneCandidatePool } from "./scene-candidates.js";
 
-describe("SceneCandidatePool", () => {
+describe("SceneCandidatePool (v2: router-driven)", () => {
   let tmpDir: string;
 
   beforeEach(async () => {
-    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "tdai-cand-"));
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "tdai-candidates-"));
     await fs.mkdir(path.join(tmpDir, ".metadata"), { recursive: true });
   });
 
@@ -16,94 +16,78 @@ describe("SceneCandidatePool", () => {
     await fs.rm(tmpDir, { recursive: true, force: true });
   });
 
-  it("adds observation and persists to JSON", async () => {
+  it("folds anchor-similar memories into one candidate, distinct into another", async () => {
     const pool = await SceneCandidatePool.load(tmpDir);
-    pool.addObservation("Python-Backend", "m_001", "session-a", "first proposal");
-    pool.addObservation("Python-Backend", "m_002", "session-b", "second proposal");
+    const axisA = [1, 0, 0, 0];
+    const axisB = [0, 1, 0, 0];
+
+    pool.addMemory({ id: "m_1", ts: "2026-08-01", head: "A1", sessionKey: "s1" , embedding: axisA  }, 0.3);
+    pool.addMemory({ id: "m_2", ts: "2026-08-02", head: "A2", sessionKey: "s1" , embedding: axisA  }, 0.3);
+    pool.addMemory({ id: "m_3", ts: "2026-08-03", head: "B1", sessionKey: "s2" , embedding: axisB  }, 0.3);
+
+    const list = pool.list();
+    expect(list).toHaveLength(2);
+    const a = list.find((c) => c.memories.some((m) => m.id === "m_1"))!;
+    expect(a.memories).toHaveLength(2);
+    // Anchor = centroid of member vectors
+    expect(a.anchor).toEqual([1, 0, 0, 0]);
+  });
+
+  it("promotes by memory count threshold", async () => {
+    const pool = await SceneCandidatePool.load(tmpDir);
+
+    // 5 memories in one session → memory threshold (5)
+    for (let i = 0; i < 5; i++) {
+      pool.addMemory(
+        { id: `many_${i}`, ts: "2026-08-01", head: `h${i}`, sessionKey: "s-z", embedding: [1, 0, 0, 0] },
+        0.3,
+      );
+    }
+    // 2 unrelated singletons stay below every threshold
+    pool.addMemory({ id: "solo_1", ts: "2026-08-01", head: "x", sessionKey: "s-a" , embedding: [0, 1, 0, 0]  }, 0.3);
+    pool.addMemory({ id: "solo_2", ts: "2026-08-01", head: "y", sessionKey: "s-b" , embedding: [0, 0, 1, 0]  }, 0.3);
+
+    const promotable = pool.findPromotable(5, 3);
+    expect(promotable).toHaveLength(1);
+    expect(promotable[0]!.memories).toHaveLength(5);
+  });
+
+  it("dedupes memory ids within a candidate", async () => {
+    const pool = await SceneCandidatePool.load(tmpDir);
+    pool.addMemory({ id: "m_1", ts: "2026-08-01", head: "h", sessionKey: "s" , embedding: [1, 0]  }, 0.3);
+    pool.addMemory({ id: "m_1", ts: "2026-08-01", head: "h", sessionKey: "s" , embedding: [1, 0]  }, 0.3);
+    expect(pool.list()[0]!.memories).toHaveLength(1);
+  });
+
+  it("persists across load/save and prunes expired candidates", async () => {
+    const pool = await SceneCandidatePool.load(tmpDir);
+    // Explicit clock: last_seen 2026-08-01 is >30d before the prune date below
+    pool.addMemory(
+      { id: "m_1", ts: "2026-08-01", head: "h", sessionKey: "s" },
+      0.3,
+      new Date("2026-08-01T00:00:00Z"),
+    );
     await pool.save();
 
-    const raw = await fs.readFile(
-      path.join(tmpDir, ".metadata", "scene_candidates.json"),
-      "utf-8",
-    );
-    const parsed = JSON.parse(raw);
-    expect(parsed).toHaveLength(1);
-    expect(parsed[0].topic).toBe("Python-Backend");
-    expect(parsed[0].matched_memory_ids).toEqual(["m_001", "m_002"]);
-    expect(parsed[0].session_keys).toEqual(["session-a", "session-b"]);
-    expect(parsed[0].recent_proposals).toHaveLength(2);
+    const reloaded = await SceneCandidatePool.load(tmpDir);
+    expect(reloaded.list()).toHaveLength(1);
+
+    const expired = reloaded.pruneExpired(30, new Date("2026-09-15T00:00:00Z"));
+    expect(expired).toHaveLength(1);
+    expect(reloaded.list()).toHaveLength(0);
   });
 
-  it("dedupes matched_memory_ids and session_keys", async () => {
+  it("sampleHeads returns up to 8 memories for the LLM prompt", async () => {
     const pool = await SceneCandidatePool.load(tmpDir);
-    pool.addObservation("Topic", "m_001", "session-a", "p1");
-    pool.addObservation("Topic", "m_001", "session-a", "p2");
-    const list = pool.list();
-    expect(list[0]!.matched_memory_ids).toEqual(["m_001"]);
-    expect(list[0]!.session_keys).toEqual(["session-a"]);
-  });
-
-  it("keeps only last 3 proposals", async () => {
-    const pool = await SceneCandidatePool.load(tmpDir);
-    for (let i = 0; i < 5; i++) {
-      pool.addObservation("Topic", `m_${i}`, "s", `p${i}`);
+    for (let i = 0; i < 12; i++) {
+      pool.addMemory(
+        { id: `m_${i}`, ts: "2026-08-01", head: `head-${i}`, sessionKey: "s", embedding: [1, 0, 0, 0] },
+        0.3,
+      );
     }
-    expect(pool.list()[0]!.recent_proposals).toHaveLength(3);
-    expect(pool.list()[0]!.recent_proposals).toEqual(["p2", "p3", "p4"]);
-  });
-
-  it("findPromotable returns candidates meeting memory threshold", async () => {
-    const pool = await SceneCandidatePool.load(tmpDir);
-    pool.addObservation("TopicA", "m1", "s1", "p");
-    pool.addObservation("TopicA", "m2", "s1", "p");
-    pool.addObservation("TopicA", "m3", "s1", "p");
-    pool.addObservation("TopicA", "m4", "s1", "p");
-    pool.addObservation("TopicA", "m5", "s1", "p");
-
-    const promotable = pool.findPromotable(5, 3);
-    expect(promotable.map((c) => c.topic)).toEqual(["TopicA"]);
-  });
-
-  it("findPromotable returns candidates meeting session threshold", async () => {
-    const pool = await SceneCandidatePool.load(tmpDir);
-    pool.addObservation("TopicB", "m1", "s1", "p");
-    pool.addObservation("TopicB", "m2", "s2", "p");
-    pool.addObservation("TopicB", "m3", "s3", "p");
-
-    const promotable = pool.findPromotable(5, 3);
-    expect(promotable.map((c) => c.topic)).toEqual(["TopicB"]);
-  });
-
-  it("removes candidate by topic", async () => {
-    const pool = await SceneCandidatePool.load(tmpDir);
-    pool.addObservation("TopicC", "m1", "s1", "p");
-    pool.remove("TopicC");
-    expect(pool.list()).toHaveLength(0);
-  });
-
-  it("prunes expired candidates", async () => {
-    const pool = await SceneCandidatePool.load(tmpDir);
-    pool.addObservation("Old", "m1", "s1", "p");
-    // Simulate old last_seen_at by direct manipulation
-    const list = pool.list();
-    list[0]!.last_seen_at = "2020-01-01T00:00:00.000Z";
-
-    const pruned = pool.pruneExpired(30, new Date("2026-08-04T00:00:00.000Z"));
-    expect(pruned).toEqual(["Old"]);
-    expect(pool.list()).toHaveLength(0);
-  });
-
-  it("returns empty array when JSON file missing", async () => {
-    const pool = await SceneCandidatePool.load(tmpDir);
-    expect(pool.list()).toEqual([]);
-  });
-
-  it("recovers gracefully from corrupted JSON", async () => {
-    await fs.writeFile(
-      path.join(tmpDir, ".metadata", "scene_candidates.json"),
-      "{not valid json",
-    );
-    const pool = await SceneCandidatePool.load(tmpDir);
-    expect(pool.list()).toEqual([]);
+    const candidate = pool.list()[0]!;
+    expect(candidate.memories).toHaveLength(12);
+    expect(pool.sampleHeads(candidate)).toHaveLength(8);
+    expect(pool.sampleHeads(candidate)[0]!.head).toBe("head-0");
   });
 });

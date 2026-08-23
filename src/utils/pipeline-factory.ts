@@ -3,12 +3,10 @@
  * MemoryPipelineManager instances with VectorStore, EmbeddingService,
  * L1 runner, L2 runner, and persister.
  *
- * Used by both:
- * - `index.ts` (live plugin runtime)
- * - `seed-runtime.ts` (standalone seed CLI command)
+ * Used by `index.ts` (live plugin runtime).
  *
  * This avoids duplicating VectorStore init, L1/L2 extraction logic,
- * persister wiring, and destroy sequences across multiple callers.
+ * persister wiring, and destroy sequences.
  */
 
 import fs from "node:fs";
@@ -25,14 +23,7 @@ import type { PipelineSessionState } from "./checkpoint.js";
 import { createStoreBundle } from "../core/store/factory.js";
 import type { IMemoryStore } from "../core/store/types.js";
 import type { EmbeddingService } from "../core/store/embedding.js";
-import {
-  readManifest,
-  writeManifest,
-  buildStoreInfo,
-  diffStoreBinding,
-  type Manifest,
-} from "./manifest.js";
-import { SceneExtractor } from "../core/scene/scene-extractor.js";
+import { readManifest, writeManifest, buildStoreInfo, diffStoreBinding, type Manifest } from "./manifest.js";
 import { pullProfilesToLocal, syncLocalProfilesToStore } from "../core/profile/profile-sync.js";
 import type { Logger } from "../core/types.js";
 
@@ -66,6 +57,15 @@ export interface PipelineFactoryOptions {
   sessionFilter?: SessionFilter;
   /** Host-neutral LLM runner for L1 extraction (text-only, enableTools=false). */
   l1LlmRunner?: import("../core/types.js").LLMRunner;
+  /** Host-neutral LLM runner for L2 scene extraction (enableTools=true). */
+  l2LlmRunner?: import("../core/types.js").LLMRunner;
+  /**
+   * Getter for the plugin instance ID used for metric reporting.
+   * Called at runner execution time (not at creation time) so that the ID is
+   * available even when the runner is wired before instanceId is resolved.
+   * Metrics are skipped when the getter returns undefined.
+   */
+  getInstanceId?: () => string | undefined;
 }
 
 // ============================
@@ -411,26 +411,26 @@ export function createPersister(
 // ============================
 
 /**
- * Create the standard L2 runner function (scene extraction).
+ * Create the standard L2 runner (v2 scene consolidation).
  *
- * Reads L1 memory records (incremental via VectorStore or JSONL fallback),
- * runs SceneExtractor, and returns the latest cursor for pipeline-manager
- * to track incremental progress.
- *
- * Used by both `index.ts` (live runtime) and `seed-runtime.ts` (seed CLI).
+ * Fetches new L1 memory records since the cursor, attaches their stored
+ * embedding vectors (falling back to embedBatch when missing), and hands
+ * everything to SceneConsolidator — the deterministic router + two LLM
+ * touchpoints (promotion title/summary, summary refresh). Returns the
+ * latest cursor for pipeline-manager incremental progress.
  */
 export function createL2Runner(opts: {
   pluginDataDir: string;
   cfg: MemoryTdaiConfig;
   openclawConfig: unknown;
   vectorStore: IMemoryStore | undefined;
+  embeddingService: EmbeddingService | undefined;
   logger: PipelineLogger;
   instanceId?: string;
-  /** Host-neutral LLM runner for L2 scene extraction (standalone/gateway mode). Must have enableTools=true. */
+  /** Host-neutral LLM runner for scene title/summary synthesis (text-only). */
   llmRunner?: import("../core/types.js").LLMRunner;
 }): L2Runner {
-  const { pluginDataDir, cfg, openclawConfig, vectorStore, logger, instanceId, llmRunner } = opts;
-  let profileBaseline = new Map<string, { version: number; contentMd5: string; createdAtMs: number }>();
+  const { pluginDataDir, cfg, openclawConfig, vectorStore, embeddingService, logger, llmRunner } = opts;
 
   return async (sessionKey: string, cursor?: string) => {
     logger.debug?.(
@@ -438,15 +438,15 @@ export function createL2Runner(opts: {
     );
 
     if (!openclawConfig && !llmRunner) {
-      logger.warn(`${TAG} [L2] No OpenClaw config and no LLM runner, skipping scene extraction`);
+      logger.warn(`${TAG} [L2] No OpenClaw config and no LLM runner, skipping scene consolidation`);
       return;
     }
 
-    let records: Array<{ content: string; created_at: string; id: string; updatedAt: string }>;
-
     if (vectorStore?.pullProfiles && !vectorStore.isDegraded()) {
-      profileBaseline = await pullProfilesToLocal(pluginDataDir, vectorStore, logger);
+      await pullProfilesToLocal(pluginDataDir, vectorStore, logger).catch(() => new Map());
     }
+
+    let records: Array<{ id: string; content: string; scene_name?: string; createdAt: string; updatedAt: string; sessionKey?: string }>;
 
     if (vectorStore && !vectorStore.isDegraded()) {
       const { queryMemoryRecords } = await import("../core/record/l1-reader.js");
@@ -457,122 +457,113 @@ export function createL2Runner(opts: {
 
       if (memRecords.length === 0) {
         logger.debug?.(
-          `${TAG} [L2] No new L1 records since cursor (session=${sessionKey}, updatedAfter=${cursor ?? "(full)"}), skipping scene extraction`,
+          `${TAG} [L2] No new L1 records since cursor (session=${sessionKey}), skipping`,
         );
         return { skipped: true, latestCursor: cursor || undefined };
       }
-
-      logger.debug?.(
-        `${TAG} [L2] Incremental query returned ${memRecords.length} record(s) (session=${sessionKey})`,
-      );
-
-      records = memRecords.map((r) => ({
-        content: r.content,
-        created_at: r.createdAt,
-        id: r.id,
-        updatedAt: r.updatedAt,
-      }));
+      records = memRecords;
     } else {
       logger.debug?.(`${TAG} [L2] VectorStore unavailable, falling back to JSONL read (session=${sessionKey})`);
       const { readMemoryRecords } = await import("../core/record/l1-reader.js");
       let sessionRecords = await readMemoryRecords(sessionKey, pluginDataDir, logger);
-
       if (cursor) {
-        const beforeCount = sessionRecords.length;
         sessionRecords = sessionRecords.filter((r) => {
           const t = r.updatedAt || r.createdAt || "";
           return t > cursor;
         });
-        logger.debug?.(
-          `${TAG} [L2] JSONL time filter: ${beforeCount} → ${sessionRecords.length} record(s) (updatedAfter=${cursor})`,
-        );
       }
-
       if (sessionRecords.length === 0) {
-        logger.debug?.(`${TAG} [L2] No new L1 records found (JSONL fallback, session=${sessionKey}), skipping scene extraction`);
         return { latestCursor: cursor || undefined };
       }
-
-      records = sessionRecords.map((r) => ({
-        content: r.content,
-        created_at: r.createdAt,
-        id: r.id,
-        updatedAt: r.updatedAt,
-      }));
+      records = sessionRecords;
     }
 
-    // Guardrail options (L2/L3 redesign) - threaded from cfg.persona so the
-    // user-configured values actually reach SceneExtractor. Wiring verified
-    // by inspection: a full pipeline test would require an LLM runner stub
-    // and VectorStore mock, which is disproportionate for a 4-line wiring fix.
-    const extractor = new SceneExtractor({
+    // Attach stored embedding vectors for routing; embed missing ones.
+    const embeddings = await resolveEmbeddings(records, vectorStore, embeddingService, logger);
+
+    const { SceneConsolidator } = await import("../core/scene/scene-consolidator.js");
+    const consolidator = new SceneConsolidator({
       dataDir: pluginDataDir,
-      config: openclawConfig!,
+      config: openclawConfig,
       model: cfg.persona.model,
-      maxScenes: cfg.persona.maxScenes,
-      sceneBackupCount: cfg.persona.sceneBackupCount,
-      sceneMaxChars: cfg.persona.sceneMaxChars,
-      sceneGrowthLimit: cfg.persona.sceneGrowthLimit,
-      sceneCreateThresholdMemories: cfg.persona.sceneCreateThresholdMemories,
-      sceneCreateThresholdSessions: cfg.persona.sceneCreateThresholdSessions,
-      sceneFullRewriteIntervalHours: cfg.persona.sceneFullRewriteIntervalHours,
-      logger,
-      instanceId,
       llmRunner,
+      embeddingService,
+      logger,
+      ttlDays: cfg.persona.sceneTtlDays,
+      routingThreshold: cfg.persona.sceneRoutingThreshold,
+      promoteThresholdMemories: cfg.persona.sceneCreateThresholdMemories,
+      promoteThresholdSessions: cfg.persona.sceneCreateThresholdSessions,
+      candidateTtlDays: cfg.persona.sceneCandidateTtlDays,
+      summaryRefreshDays: cfg.persona.sceneSummaryRefreshDays,
+      summaryRefreshNewMemories: cfg.persona.sceneSummaryRefreshNewMemories,
+      summaryMaxChars: cfg.persona.sceneSummaryMaxChars,
     });
 
-    const memories = records.map((r) => ({
-      content: r.content,
-      created_at: r.created_at,
-      id: r.id,
-    }));
+    await consolidator.consolidate(
+      records.map((r) => ({
+        id: r.id,
+        content: r.content,
+        sceneName: r.scene_name,
+        createdAt: r.createdAt,
+        sessionKey: r.sessionKey,
+        embedding: embeddings.get(r.id),
+      })),
+    );
 
-    const preCheckpoint = new CheckpointManager(pluginDataDir, logger);
-    const preState = await preCheckpoint.read();
-    const preScenesProcessed = preState.scenes_processed;
-    const preMemoriesSince = preState.memories_since_last_persona;
-    const preTotalProcessed = preState.total_processed;
-
-    const extractResult = await extractor.extract(memories, sessionKey);
-    if (extractResult.success && extractResult.memoriesProcessed > 0) {
-      const checkpoint = new CheckpointManager(pluginDataDir, logger);
-      const postState = await checkpoint.read();
-      if (
-        postState.scenes_processed < preScenesProcessed ||
-        postState.total_processed < preTotalProcessed
-      ) {
-        logger.warn(
-          `${TAG} [L2] ⚠️ Checkpoint corruption detected! ` +
-          `scenes_processed: ${preScenesProcessed} → ${postState.scenes_processed}, ` +
-          `total_processed: ${preTotalProcessed} → ${postState.total_processed}, ` +
-          `memories_since: ${preMemoriesSince} → ${postState.memories_since_last_persona}. ` +
-          `Repairing...`,
-        );
-        await checkpoint.write({
-          ...postState,
-          scenes_processed: Math.max(postState.scenes_processed, preScenesProcessed),
-          total_processed: Math.max(postState.total_processed, preTotalProcessed),
-          memories_since_last_persona: Math.max(postState.memories_since_last_persona, preMemoriesSince),
-        });
-        logger.info(`${TAG} [L2] Checkpoint repaired`);
-      }
-
-      if (vectorStore && supportsProfileSyncWrite(vectorStore)) {
-        await syncLocalProfilesToStore(pluginDataDir, vectorStore, profileBaseline, logger);
-      }
-      await checkpoint.incrementScenesProcessed();
-
-      const latestCursor = records.reduce((latest, r) => {
-        return r.updatedAt > latest ? r.updatedAt : latest;
-      }, "");
-
-      logger.debug?.(
-        `${TAG} [L2] Extraction complete: processed=${extractResult.memoriesProcessed}, latestCursor=${latestCursor}`,
-      );
-
-      return { latestCursor: latestCursor || undefined };
+    if (vectorStore && supportsProfileSyncWrite(vectorStore)) {
+      await syncLocalProfilesToStore(pluginDataDir, vectorStore, new Map(), logger).catch((err) => {
+        logger.warn?.(`${TAG} [L2] profile sync write-back failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+      });
     }
+
+    const latestCursor = records.reduce((latest, r) => {
+      return r.updatedAt > latest ? r.updatedAt : latest;
+    }, "");
+    logger.debug?.(`${TAG} [L2] Consolidation complete: ${records.length} records, latestCursor=${latestCursor}`);
+    return { latestCursor: latestCursor || undefined };
   };
+}
+
+/**
+ * Resolve routing embeddings for a batch of L1 records: prefer vectors
+ * already stored in vectors.db; embed the remainder (up to a bound) via
+ * the embedding service. Records left without a vector degrade to the
+ * router's text-fallback signal.
+ */
+async function resolveEmbeddings(
+  records: Array<{ id: string; content: string }>,
+  vectorStore: IMemoryStore | undefined,
+  embeddingService: EmbeddingService | undefined,
+  logger: PipelineLogger,
+): Promise<Map<string, Float32Array | number[]>> {
+  const byId = new Map<string, Float32Array | number[]>();
+
+  if (vectorStore?.getL1Embeddings && !vectorStore.isDegraded()) {
+    try {
+      const rows = await vectorStore.getL1Embeddings(records.map((r) => r.id));
+      for (const row of rows) {
+        if (row.embedding) byId.set(row.record_id, row.embedding);
+      }
+    } catch (err) {
+      logger.warn?.(`${TAG} [L2] getL1Embeddings failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  const missing = records.filter((r) => !byId.has(r.id) && r.content);
+  if (missing.length > 0 && embeddingService) {
+    try {
+      const vectors = await embeddingService.embedBatch(missing.map((r) => r.content));
+      for (let i = 0; i < missing.length; i++) {
+        if (vectors[i] && vectors[i]!.length > 0) byId.set(missing[i]!.id, vectors[i]!);
+      }
+    } catch (err) {
+      logger.warn?.(
+        `${TAG} [L2] embedBatch fallback failed (${missing.length} records degrade to text routing): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  return byId;
 }
 
 // ============================
@@ -605,19 +596,75 @@ export function createPipelineManager(
 }
 
 // ============================
+// Standalone LLM runner factory
+// ============================
+
+function standaloneLlmConfigured(cfg: MemoryTdaiConfig): boolean {
+  return cfg.llm.enabled && !!cfg.llm.apiKey;
+}
+
+/**
+ * Build the L1 standalone LLM runner (text-only) from `cfg.llm`.
+ *
+ * Parity with the old `TdaiCore.wirePipelineRunners()`: when `llm.enabled` is
+ * set (with an API key), L1 extraction bypasses the OpenClaw embedded agent
+ * and calls the configured OpenAI-compatible endpoint directly.
+ *
+ * Returns `undefined` when the standalone override is not configured.
+ */
+export async function createStandaloneL1RunnerFromConfig(
+  cfg: MemoryTdaiConfig,
+): Promise<import("../core/types.js").LLMRunner | undefined> {
+  if (!standaloneLlmConfigured(cfg)) return undefined;
+
+  const { createOpenAICompatibleRunner } = await import("../core/utils/openai-runner.js");
+  return createOpenAICompatibleRunner({
+    baseUrl: cfg.llm.baseUrl,
+    apiKey: cfg.llm.apiKey,
+    model: cfg.llm.model,
+    maxTokens: cfg.llm.maxTokens,
+    timeoutMs: cfg.llm.timeoutMs,
+    disableThinking: cfg.llm.disableThinking,
+  });
+}
+
+/**
+ * Build the L2 standalone LLM runner (text-only) from `cfg.llm`.
+ *
+ * v2 L2 touches the LLM only for scene title/summary synthesis — single-turn
+ * JSON calls with no file tools — so the plain OpenAI-compatible runner is
+ * sufficient. Returns `undefined` when the override is not configured.
+ */
+export async function createStandaloneL2RunnerFromConfig(
+  cfg: MemoryTdaiConfig,
+): Promise<import("../core/types.js").LLMRunner | undefined> {
+  if (!standaloneLlmConfigured(cfg)) return undefined;
+
+  const { createOpenAICompatibleRunner } = await import("../core/utils/openai-runner.js");
+  return createOpenAICompatibleRunner({
+    baseUrl: cfg.llm.baseUrl,
+    apiKey: cfg.llm.apiKey,
+    model: cfg.llm.model,
+    maxTokens: cfg.llm.maxTokens,
+    timeoutMs: cfg.llm.timeoutMs,
+    disableThinking: cfg.llm.disableThinking,
+  });
+}
+
+// ============================
 // Full pipeline factory
 // ============================
 
 /**
  * Create a fully wired pipeline instance: VectorStore + EmbeddingService +
- * MemoryPipelineManager with L1 runner and persister attached.
+ * MemoryPipelineManager with L1 runner, L2 runner, and persister attached.
  *
- * This is the high-level entry point used by both `index.ts` and `seed-runtime.ts`.
- * Callers should attach L2 runner after creation using `createL2Runner()`
- * from this module.
+ * This is the high-level entry point used by `index.ts`.
+ * When `cfg.llm.enabled` is set, standalone LLM runners are derived from the
+ * config (unless explicitly overridden via `l1LlmRunner`/`l2LlmRunner`).
  */
 export async function createPipeline(opts: PipelineFactoryOptions): Promise<PipelineInstance> {
-  const { pluginDataDir, cfg, openclawConfig, logger, sessionFilter, l1LlmRunner } = opts;
+  const { pluginDataDir, cfg, openclawConfig, logger, sessionFilter, getInstanceId } = opts;
 
   // Ensure data directories exist
   initDataDirectories(pluginDataDir);
@@ -625,6 +672,19 @@ export async function createPipeline(opts: PipelineFactoryOptions): Promise<Pipe
   // Initialize stores (once-async: reuses cached result if already initialized)
   const stores = await initStores(cfg, pluginDataDir, logger);
   const { vectorStore, embeddingService } = stores;
+
+  // Standalone LLM override (parity with old TdaiCore.wirePipelineRunners):
+  // when cfg.llm is enabled, L1/L2 extraction bypasses the host embedded agent.
+  // Explicitly passed runners take precedence over the config-derived ones.
+  let l1LlmRunner = opts.l1LlmRunner;
+  let l2LlmRunner = opts.l2LlmRunner;
+  if (standaloneLlmConfigured(cfg) && (!l1LlmRunner || !l2LlmRunner)) {
+    if (!l1LlmRunner) l1LlmRunner = await createStandaloneL1RunnerFromConfig(cfg);
+    if (!l2LlmRunner) l2LlmRunner = await createStandaloneL2RunnerFromConfig(cfg);
+    logger.info(
+      `${TAG} Using standalone LLM override: model=${cfg.llm.model}, baseUrl=${cfg.llm.baseUrl}`,
+    );
+  }
 
   // Create pipeline manager
   const scheduler = createPipelineManager(cfg, logger, sessionFilter);
@@ -637,11 +697,28 @@ export async function createPipeline(opts: PipelineFactoryOptions): Promise<Pipe
     vectorStore,
     embeddingService,
     logger,
+    getInstanceId,
     llmRunner: l1LlmRunner,
   }));
 
   // Wire persister
   scheduler.setPersister(createPersister(pluginDataDir, logger));
+
+  // Wire L2 runner (v2 scene consolidation). The inner runner is created lazily at
+  // execution time so getInstanceId() resolves after async instanceId init.
+  scheduler.setL2Runner(async (sessionKey: string, cursor?: string) => {
+    const l2Runner = createL2Runner({
+      pluginDataDir,
+      cfg,
+      openclawConfig,
+      vectorStore,
+      embeddingService,
+      logger,
+      instanceId: getInstanceId?.(),
+      llmRunner: l2LlmRunner,
+    });
+    return l2Runner(sessionKey, cursor);
+  });
 
   // Destroy function
   const destroy = async () => {

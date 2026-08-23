@@ -17,23 +17,23 @@ describe("LocalMemoryCleaner - candidate pool cleanup", () => {
   });
 
   it("prunes expired candidates when sceneCandidateTtlDays > 0", async () => {
-    // Seed candidate pool with one expired and one fresh candidate.
+    // Seed candidate pool (v2 router-driven format) with one expired and one fresh candidate.
     const candidates = [
       {
-        topic: "OldTopic",
-        matched_memory_ids: ["m_1"],
+        id: "cand_old",
+        anchor: null,
+        memories: [{ id: "m_1", ts: "2020-01-01", head: "h", sessionKey: "s1" }],
         session_keys: ["s1"],
         first_seen_at: "2020-01-01T00:00:00.000Z",
         last_seen_at: "2020-01-01T00:00:00.000Z",
-        recent_proposals: ["p1"],
       },
       {
-        topic: "FreshTopic",
-        matched_memory_ids: ["m_2"],
+        id: "cand_fresh",
+        anchor: null,
+        memories: [{ id: "m_2", ts: "2026-08-01", head: "h", sessionKey: "s1" }],
         session_keys: ["s1"],
         first_seen_at: "2026-08-01T00:00:00.000Z",
         last_seen_at: "2026-08-03T00:00:00.000Z",
-        recent_proposals: ["p2"],
       },
     ];
     await fs.writeFile(
@@ -50,9 +50,8 @@ describe("LocalMemoryCleaner - candidate pool cleanup", () => {
       sceneCandidateTtlDays: 30,
     });
 
-    // Use a fixed "now" well after the FreshTopic's last_seen_at so the
-    // OldTopic (last seen 2020) is expired but FreshTopic (last seen 2026-08-03)
-    // is still within the 30-day TTL.
+    // Fixed "now" well after FreshTopic's last_seen_at so the old candidate
+    // (last seen 2020) is expired but the fresh one (2026-08-03) is within TTL.
     await cleaner.runOnce(Date.parse("2026-08-04T03:00:00.000Z"));
 
     const raw = await fs.readFile(
@@ -61,7 +60,7 @@ describe("LocalMemoryCleaner - candidate pool cleanup", () => {
     );
     const parsed = JSON.parse(raw);
     expect(parsed).toHaveLength(1);
-    expect(parsed[0].topic).toBe("FreshTopic");
+    expect(parsed[0].id).toBe("cand_fresh");
   });
 
   it("skips candidate cleanup when sceneCandidateTtlDays = 0", async () => {
@@ -158,68 +157,58 @@ describe("LocalMemoryCleaner - scene blocks TTL cleanup", () => {
     await fs.rm(tmpDir, { recursive: true, force: true });
   });
 
-  it("preserves scene files with unparseable META.updated timestamp", async () => {
-    // Scene with valid updated (old, past TTL)
+  it("preserves v2 scene files with unparseable last_active, archives expired ones", async () => {
+    // Scene with old last_active (past TTL) → archived
     await fs.writeFile(
       path.join(tmpDir, "scene_blocks", "OldScene.md"),
       `-----META-START-----
+title: OldScene
 created: 2020-01-01T00:00:00.000Z
 updated: 2020-01-01T00:00:00.000Z
+first_active: 2020-01-01T00:00:00.000Z
+last_active: 2020-01-01T00:00:00.000Z
 summary: old scene
-heat: 0
-last_full_rewrite_at: 2020-01-01T00:00:00.000Z
+memory_count: 1
 -----META-END-----
 
-# Old Scene
-content`,
+## Memory Pointers
+- m_1 | 2020-01-01 | old`,
       "utf-8",
     );
 
-    // Scene with unparseable updated (empty string)
+    // Scene with unparseable last_active → preserved (can't age it safely)
     await fs.writeFile(
       path.join(tmpDir, "scene_blocks", "NoUpdated.md"),
       `-----META-START-----
+title: NoUpdated
 created: 2026-08-01T00:00:00.000Z
-updated:
-summary: no updated timestamp
-heat: 5
-last_full_rewrite_at:
+updated: 2026-08-01T00:00:00.000Z
+first_active: 2026-08-01T00:00:00.000Z
+last_active: not-a-date
+summary: no parseable activity time
+memory_count: 1
 -----META-END-----
 
-# No Updated
-content`,
+## Memory Pointers
+- m_2 | 2026-08-01 | x`,
       "utf-8",
     );
 
-    // Scene with recent updated (within TTL)
+    // Scene with recent last_active (within TTL) → preserved
     await fs.writeFile(
       path.join(tmpDir, "scene_blocks", "RecentScene.md"),
       `-----META-START-----
+title: RecentScene
 created: 2026-08-01T00:00:00.000Z
 updated: 2026-08-03T00:00:00.000Z
+first_active: 2026-08-01T00:00:00.000Z
+last_active: 2026-08-03T00:00:00.000Z
 summary: recent scene
-heat: 10
-last_full_rewrite_at: 2026-08-03T00:00:00.000Z
+memory_count: 2
 -----META-END-----
 
-# Recent Scene
-content`,
-      "utf-8",
-    );
-
-    // Scene with high heat (within TTL) — ensures OldScene is outside top-3
-    await fs.writeFile(
-      path.join(tmpDir, "scene_blocks", "HighHeatScene.md"),
-      `-----META-START-----
-created: 2026-08-01T00:00:00.000Z
-updated: 2026-08-03T00:00:00.000Z
-summary: high heat scene
-heat: 20
-last_full_rewrite_at: 2026-08-03T00:00:00.000Z
------META-END-----
-
-# High Heat Scene
-content`,
+## Memory Pointers
+- m_3 | 2026-08-03 | recent`,
       "utf-8",
     );
 
@@ -233,13 +222,16 @@ content`,
 
     await cleaner.runOnce(Date.parse("2026-08-04T03:00:00.000Z"));
 
-    // OldScene: past TTL, heat=1 (not top-3) → should be deleted
+    // OldScene: past TTL → archived away
     await expect(fs.stat(path.join(tmpDir, "scene_blocks", "OldScene.md"))).rejects.toThrow();
+    await expect(
+      fs.stat(path.join(tmpDir, ".backup", "scene_blocks_expired", "OldScene.md")),
+    ).resolves.toBeDefined();
 
-    // NoUpdated: unparseable timestamp → should be preserved (not deleted)
+    // NoUpdated: unparseable timestamp → preserved (not archived)
     await expect(fs.stat(path.join(tmpDir, "scene_blocks", "NoUpdated.md"))).resolves.toBeDefined();
 
-    // RecentScene: within TTL, heat=10 → should be preserved
+    // RecentScene: within TTL → preserved
     await expect(fs.stat(path.join(tmpDir, "scene_blocks", "RecentScene.md"))).resolves.toBeDefined();
   });
 });

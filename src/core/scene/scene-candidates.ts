@@ -1,39 +1,50 @@
 /**
- * Scene Candidate Pool: tracks LLM-proposed scene topics that haven't yet
- * been promoted to formal scene_blocks/*.md files.
+ * Scene Candidate Pool (v2): engineering-driven topic incubator.
  *
- * Storage: <dataDir>/.metadata/scene_candidates.json (single JSON array,
- * independent from recall_checkpoint.json to avoid polluting checkpoint).
+ * v1 fed candidates from LLM [PROPOSE_CANDIDATE] text signals. v2 removes
+ * the LLM from this path entirely: the router (scene-router.ts) pushes
+ * unmatched memories here, similarity is computed against each candidate's
+ * running-centroid anchor, and promotion is a pure counter check.
  *
  * Lifecycle:
- *   1. LLM emits [PROPOSE_CANDIDATE] in text output when no existing scene
- *      matches new memories.
- *   2. SceneExtractor parses the signal, calls addObservation().
- *   3. After each extraction, findPromotable() is called — candidates meeting
- *      memory-count OR session-count threshold are returned for promotion.
- *   4. Promoted candidates are removed from the pool and a formal scene file
- *      is created via a dedicated LLM call.
- *   5. pruneExpired() is called by the daily memory-cleaner to drop dead topics.
+ *   1. Router leaves a memory unmatched → pool.addMemory()
+ *   2. addMemory folds it into an anchor-similar candidate or creates one
+ *   3. findPromotable() returns candidates meeting the memory-count OR
+ *      session-count threshold — the consolidator promotes them via one
+ *      LLM call (title + summary synthesis)
+ *   4. pruneExpired() drops topics with no new evidence within TTL days
+ *
+ * Storage: <dataDir>/.metadata/scene_candidates.json (atomic rewrite).
  */
 
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
+import { cosineSimilarity } from "./scene-router.js";
 import type { Logger } from "../types.js";
 
 const TAG = "[memory-tdai][candidates]";
 
+export interface CandidateMemory {
+  id: string;
+  ts: string;
+  /** Short content head — used for LLM title synthesis and debugging. */
+  head: string;
+  sessionKey: string;
+}
+
 export interface SceneCandidate {
-  topic: string;
-  matched_memory_ids: string[];
+  id: string;
+  /** Running centroid of member-memory embeddings; null in degraded mode. */
+  anchor: number[] | null;
+  memories: CandidateMemory[];
   session_keys: string[];
   first_seen_at: string;
   last_seen_at: string;
-  recent_proposals: string[];
 }
 
-const MAX_PROPOSALS = 3;
-const CANDIDATES_FILENAME = "scene_candidates.json";
+/** Heads kept per candidate — bounds the JSON file and the LLM prompt. */
+const MAX_SAMPLE_HEADS = 8;
 
 export class SceneCandidatePool {
   private candidates: SceneCandidate[] = [];
@@ -41,7 +52,7 @@ export class SceneCandidatePool {
   private readonly logger?: Logger;
 
   private constructor(dataDir: string, logger?: Logger) {
-    this.filePath = path.join(dataDir, ".metadata", CANDIDATES_FILENAME);
+    this.filePath = path.join(dataDir, ".metadata", "scene_candidates.json");
     this.logger = logger;
   }
 
@@ -60,82 +71,89 @@ export class SceneCandidatePool {
         this.candidates = [];
         return;
       }
-      this.candidates = parsed.filter(this.isValidCandidate.bind(this));
+      this.candidates = parsed.filter(isValidCandidate);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
         this.candidates = [];
         return;
       }
-      // Corrupted JSON — start empty (non-fatal)
       this.logger?.warn?.(
-        `${TAG} candidates JSON corrupted, starting empty: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
+        `${TAG} candidates JSON corrupted, starting empty: ${err instanceof Error ? err.message : String(err)}`,
       );
       this.candidates = [];
     }
-  }
-
-  private isValidCandidate(x: unknown): x is SceneCandidate {
-    if (!x || typeof x !== "object") return false;
-    const o = x as Record<string, unknown>;
-    return (
-      typeof o.topic === "string" &&
-      Array.isArray(o.matched_memory_ids) &&
-      Array.isArray(o.session_keys) &&
-      typeof o.first_seen_at === "string" &&
-      typeof o.last_seen_at === "string" &&
-      Array.isArray(o.recent_proposals)
-    );
   }
 
   list(): SceneCandidate[] {
     return [...this.candidates];
   }
 
-  addObservation(
-    topic: string,
-    memoryId: string,
-    sessionKey: string,
-    proposal: string,
+  /**
+   * Fold a router-unmatched memory into an anchor-similar candidate, or
+   * create a new candidate when nothing is similar enough.
+   */
+  addMemory(
+    mem: CandidateMemory & { embedding?: Float32Array | number[] },
+    matchThreshold: number,
     now: Date = new Date(),
   ): void {
     const iso = now.toISOString();
-    let cand = this.candidates.find((c) => c.topic === topic);
-    if (!cand) {
-      cand = {
-        topic,
-        matched_memory_ids: [],
+    let target: SceneCandidate | undefined;
+
+    if (mem.embedding && mem.embedding.length > 0) {
+      for (const cand of this.candidates) {
+        if (!cand.anchor) continue;
+        const score = cosineSimilarity(mem.embedding, cand.anchor);
+        if (score >= matchThreshold) {
+          target = cand;
+          break;
+        }
+      }
+    }
+
+    if (!target) {
+      target = {
+        id: `cand_${Date.now()}_${randomBytes(3).toString("hex")}`,
+        anchor: null,
+        memories: [],
         session_keys: [],
         first_seen_at: iso,
         last_seen_at: iso,
-        recent_proposals: [],
       };
-      this.candidates.push(cand);
+      this.candidates.push(target);
     }
-    if (!cand.matched_memory_ids.includes(memoryId)) {
-      cand.matched_memory_ids.push(memoryId);
+
+    if (!target.memories.some((m) => m.id === mem.id)) {
+      target.memories.push({ id: mem.id, ts: mem.ts, head: mem.head, sessionKey: mem.sessionKey });
     }
-    if (!cand.session_keys.includes(sessionKey)) {
-      cand.session_keys.push(sessionKey);
+    if (mem.sessionKey && !target.session_keys.includes(mem.sessionKey)) {
+      target.session_keys.push(mem.sessionKey);
     }
-    cand.recent_proposals.push(proposal);
-    if (cand.recent_proposals.length > MAX_PROPOSALS) {
-      cand.recent_proposals = cand.recent_proposals.slice(-MAX_PROPOSALS);
+
+    // Incremental centroid: fold the new vector into the running mean.
+    if (mem.embedding && mem.embedding.length > 0) {
+      const n = target.memories.length;
+      const dims = mem.embedding.length;
+      if (!target.anchor) {
+        target.anchor = Array.from(mem.embedding, (v) => v as number);
+      } else if (target.anchor.length === dims) {
+        target.anchor = target.anchor.map(
+          (old, i) => (old * (n - 1) + (mem.embedding as ArrayLike<number>)[i]!) / n,
+        );
+      }
     }
-    cand.last_seen_at = iso;
+
+    target.last_seen_at = iso;
   }
 
   findPromotable(thresholdMemories: number, thresholdSessions: number): SceneCandidate[] {
     return this.candidates.filter(
-      (c) =>
-        c.matched_memory_ids.length >= thresholdMemories ||
-        c.session_keys.length >= thresholdSessions,
+      (c) => c.memories.length >= thresholdMemories || c.session_keys.length >= thresholdSessions,
     );
   }
 
-  remove(topic: string): void {
-    this.candidates = this.candidates.filter((c) => c.topic !== topic);
+  remove(id: string): void {
+    this.candidates = this.candidates.filter((c) => c.id !== id);
   }
 
   pruneExpired(ttlDays: number, now: Date = new Date()): string[] {
@@ -145,13 +163,18 @@ export class SceneCandidatePool {
     for (const c of this.candidates) {
       const lastMs = Date.parse(c.last_seen_at);
       if (Number.isFinite(lastMs) && lastMs < cutoffMs) {
-        expired.push(c.topic);
+        expired.push(c.id);
       } else {
         survivors.push(c);
       }
     }
     this.candidates = survivors;
     return expired;
+  }
+
+  /** Up to MAX_SAMPLE_HEADS memory samples, oldest first — LLM prompt input. */
+  sampleHeads(candidate: SceneCandidate): Array<{ head: string; ts: string }> {
+    return candidate.memories.slice(0, MAX_SAMPLE_HEADS).map((m) => ({ head: m.head, ts: m.ts }));
   }
 
   async save(): Promise<void> {
@@ -161,4 +184,17 @@ export class SceneCandidatePool {
     await fs.writeFile(tmp, JSON.stringify(this.candidates, null, 2), "utf-8");
     await fs.rename(tmp, this.filePath);
   }
+}
+
+function isValidCandidate(x: unknown): x is SceneCandidate {
+  if (!x || typeof x !== "object") return false;
+  const o = x as Record<string, unknown>;
+  return (
+    typeof o.id === "string" &&
+    Array.isArray(o.memories) &&
+    Array.isArray(o.session_keys) &&
+    typeof o.first_seen_at === "string" &&
+    typeof o.last_seen_at === "string" &&
+    (o.anchor === null || Array.isArray(o.anchor))
+  );
 }
