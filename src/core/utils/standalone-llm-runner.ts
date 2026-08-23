@@ -166,7 +166,6 @@ export class StandaloneLLMRunner implements LLMRunner {
     const provider = createOpenAI({
       baseURL: this.config.baseUrl,
       apiKey: this.config.apiKey,
-      compatibility: "compatible",
       ...(this.customFetch ? { fetch: this.customFetch } : {}),
     });
 
@@ -181,7 +180,7 @@ export class StandaloneLLMRunner implements LLMRunner {
         prompt: params.prompt,
         ...(tools ? { tools } : {}),
         stopWhen: stepCountIs(this.enableTools ? MAX_TOOL_ITERATIONS : 1),
-        maxTokens,
+        maxOutputTokens: maxTokens,
         abortSignal: AbortSignal.timeout(timeoutMs),
       });
 

@@ -1,11 +1,22 @@
 /**
  * CleanContextRunner: executes LLM calls in a fully isolated context
- * using runEmbeddedPiAgent (same mechanism as the llm-task extension).
+ * through the OpenClaw plugin runtime.
+ *
+ * Migration note (openclaw ≥ 2026.5): the legacy
+ * `runtime.agent.runEmbeddedPiAgent` API and `agents.defaults.systemPromptOverride`
+ * config field were removed from OpenClaw. This runner now uses:
+ *
+ * - enableTools=false → `runtime.llm.complete` with
+ *   `execution.mode: "isolated-agent-runtime"` (fresh, zero-tool completion
+ *   with full system-prompt control — same pattern as the llm-task extension)
+ * - enableTools=true → `runtime.agent.runEmbeddedAgent` with a restricted
+ *   tool allow list; the extraction prompt travels via `extraSystemPrompt`
  *
  * Guarantees:
- * 1. Blank conversation history (temporary session file)
+ * 1. Blank conversation history (fresh unique session per run)
  * 2. Independent system prompt (only the task prompt)
- * 3. No tool calls when enableTools=false (disableTools:true — no tool definitions sent to API)
+ * 3. No tool calls when enableTools=false (isolated completion is zero-tool
+ *    by definition; the embedded path passes disableTools:true)
  * 4. No contamination from the main agent's context
  */
 
@@ -13,18 +24,12 @@ import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
-import { getEnv } from "./env.js";
 import { report } from "../core/report/reporter.js";
 import type { Logger } from "../core/types.js";
 
 /**
  * Resolve a preferred temporary directory for memory-tdai operations.
  *
- * Previously imported from `openclaw/plugin-sdk` as `resolvePreferredOpenClawTmpDir`,
- * but that export was removed in openclaw 2026.2.23+. This local implementation
- * provides equivalent behavior:
  *   1. Try `/tmp/openclaw` (if writable)
  *   2. Fall back to `os.tmpdir()/openclaw-<uid>`
  */
@@ -52,131 +57,81 @@ const TAG = "[memory-tdai] [runner]";
 
 type RunnerLogger = Logger;
 
-// Dynamic import type — runEmbeddedPiAgent is an internal API
-// Prefer the public plugin runtime signature so host-injected runtimes stay assignable.
-type RunEmbeddedPiAgentFn = OpenClawPluginApi["runtime"]["agent"]["runEmbeddedPiAgent"];
+// ── Plugin runtime seam ──
+// Structural subset of `OpenClawPluginApi["runtime"]` — the exact surface this
+// runner calls. Declared locally so the module stays typecheckable without the
+// openclaw package installed (it is a peer dependency, resolved by the host).
 
-export interface EmbeddedAgentRuntimeLike {
-  runEmbeddedPiAgent?: RunEmbeddedPiAgentFn;
+export interface LlmCompleteCallParams {
+  messages: [{ role: "user"; content: string }];
+  systemPrompt?: string;
+  /** Model ref (e.g. "anthropic/claude-sonnet-4-6"); defaults to the agent's model. */
+  model?: string;
+  maxTokens?: number;
+  temperature?: number;
+  signal?: AbortSignal;
+  purpose?: string;
+  execution: {
+    mode: "isolated-agent-runtime";
+    authProfileId?: string;
+    timeoutMs?: number;
+  };
 }
 
-let _preferredAgentRuntime: EmbeddedAgentRuntimeLike | undefined;
-
-export function setPreferredEmbeddedAgentRuntime(
-  agentRuntime: EmbeddedAgentRuntimeLike | undefined,
-): void {
-  _preferredAgentRuntime = agentRuntime;
+export interface LlmCompleteCallResult {
+  text: string;
+  provider: string;
+  model: string;
 }
 
-function resolveInjectedRunEmbeddedPiAgent(
-  agentRuntime?: EmbeddedAgentRuntimeLike,
-): RunEmbeddedPiAgentFn | undefined {
-  const candidate =
-    agentRuntime?.runEmbeddedPiAgent ?? _preferredAgentRuntime?.runEmbeddedPiAgent;
-  return typeof candidate === "function" ? candidate : undefined;
+export interface RunEmbeddedAgentCallParams {
+  sessionId: string;
+  runId: string;
+  sessionKey?: string;
+  workspaceDir: string;
+  config?: Record<string, unknown>;
+  prompt: string;
+  timeoutMs: number;
+  provider?: string;
+  model?: string;
+  disableTools?: boolean;
+  extraSystemPrompt?: string;
+  streamParams?: { maxTokens?: number };
+  /** What initiated this agent run: "user" | "heartbeat" | "cron" | "memory" | "overflow" | "manual". */
+  trigger?: string;
 }
 
-async function resolveRunEmbeddedPiAgent(
-  agentRuntime: EmbeddedAgentRuntimeLike | undefined,
-  logger?: RunnerLogger,
-): Promise<RunEmbeddedPiAgentFn> {
-  const injected = resolveInjectedRunEmbeddedPiAgent(agentRuntime);
-  if (injected) {
-    logger?.debug?.(
-      `${TAG} resolveRunEmbeddedPiAgent: using injected runtime.agent.runEmbeddedPiAgent`,
-    );
-    logger?.debug?.(`${TAG} [l1-debug] RESOLVE source=injected`);
-    return injected;
-  }
-  logger?.debug?.(`${TAG} [l1-debug] RESOLVE source=dist-fallback`);
-  return loadRunEmbeddedPiAgent(logger);
+export interface RunEmbeddedAgentCallResult {
+  payloads?: Array<{ text?: string; isError?: boolean } | undefined>;
 }
 
-// ── Core import (mirrors voice-call/core-bridge.ts — dist/ only, no jiti) ──
-
-let _rootCache: string | null = null;
-
-function findPackageRoot(startDir: string, name: string): string | null {
-  let dir = startDir;
-  for (;;) {
-    const pkgPath = path.join(dir, "package.json");
-    try {
-      if (fsSync.existsSync(pkgPath)) {
-        const raw = fsSync.readFileSync(pkgPath, "utf8");
-        const pkg = JSON.parse(raw) as { name?: string };
-        if (pkg.name === name) return dir;
-      }
-    } catch { /* ignore */ }
-    const parent = path.dirname(dir);
-    if (parent === dir) return null;
-    dir = parent;
-  }
+export interface PluginRuntimeLike {
+  llm?: { complete?: (params: LlmCompleteCallParams) => Promise<LlmCompleteCallResult> };
+  agent?: { runEmbeddedAgent?: (params: RunEmbeddedAgentCallParams) => Promise<RunEmbeddedAgentCallResult> };
 }
 
-function resolveOpenClawRoot(): string {
-  if (_rootCache) return _rootCache;
-  const override = getEnv("OPENCLAW_ROOT")?.trim();
-  if (override) { _rootCache = override; return override; }
-
-  const candidates = new Set<string>();
-  if (process.argv[1]) candidates.add(path.dirname(process.argv[1]));
-  candidates.add(process.cwd());
-  try { candidates.add(path.dirname(fileURLToPath(import.meta.url))); } catch { /* ignore */ }
-
-  for (const start of candidates) {
-    const found = findPackageRoot(start, "openclaw");
-    if (found) { _rootCache = found; return found; }
-  }
-  throw new Error("Unable to resolve OpenClaw root. Set OPENCLAW_ROOT or run `pnpm build`.");
-}
-
-let _loadPromise: Promise<RunEmbeddedPiAgentFn> | null = null;
-
-function loadRunEmbeddedPiAgent(logger?: RunnerLogger): Promise<RunEmbeddedPiAgentFn> {
-  if (_loadPromise) return _loadPromise;
-
-  _loadPromise = (async () => {
-    const t0 = Date.now();
-    const distPath = path.join(resolveOpenClawRoot(), "dist", "extensionAPI.js");
-    if (!fsSync.existsSync(distPath)) {
-      throw new Error(`Missing core module at ${distPath}. Run \`pnpm build\` or install the official package.`);
-    }
-    const mod = await import(pathToFileURL(distPath).href);
-    if (typeof mod.runEmbeddedPiAgent !== "function") {
-      throw new Error("runEmbeddedPiAgent not exported from dist/extensionAPI.js");
-    }
-    logger?.info(`${TAG} loadRunEmbeddedPiAgent: dist/ import OK (${Date.now() - t0}ms)`);
-    return mod.runEmbeddedPiAgent as RunEmbeddedPiAgentFn;
-  })();
-
-  _loadPromise.catch(() => { _loadPromise = null; });
-  return _loadPromise;
-}
+let _preferredRuntime: PluginRuntimeLike | undefined;
 
 /**
- * Pre-warm the embedded agent import. Call this during plugin init to avoid
- * the cold-start penalty on the first actual extraction run.
- * Returns immediately (fire-and-forget) — errors are swallowed.
+ * Register the host-provided plugin runtime (usually `api.runtime`).
+ * Called once at plugin registration; the stored runtime is used when a
+ * runner is constructed without an explicit `agentRuntime`.
  */
-export function prewarmEmbeddedAgent(
-  logger?: RunnerLogger,
-  agentRuntime?: EmbeddedAgentRuntimeLike,
-): void {
-  if (resolveInjectedRunEmbeddedPiAgent(agentRuntime)) {
-    logger?.debug?.(
-      `${TAG} prewarmEmbeddedAgent: runtime capability already available, skipping legacy preload`,
-    );
-    return;
-  }
-
-  loadRunEmbeddedPiAgent(logger).catch((err) => {
-    logger?.warn(`${TAG} prewarmEmbeddedAgent: failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
-  });
+export function setPreferredPluginRuntime(runtime: PluginRuntimeLike | undefined): void {
+  _preferredRuntime = runtime;
 }
 
-function collectText(payloads: Array<{ text?: string; isError?: boolean }> | undefined): string {
+function resolveRuntime(agentRuntime?: PluginRuntimeLike): PluginRuntimeLike | undefined {
+  const candidate = agentRuntime ?? _preferredRuntime;
+  if (!candidate) return undefined;
+  const hasLlm = typeof candidate.llm?.complete === "function";
+  const hasAgent = typeof candidate.agent?.runEmbeddedAgent === "function";
+  return hasLlm || hasAgent ? candidate : undefined;
+}
+
+function collectText(payloads: RunEmbeddedAgentCallResult["payloads"]): string {
   const texts = (payloads ?? [])
-    .filter((p) => !p.isError && typeof p.text === "string")
+    .filter((p): p is { text?: string; isError?: boolean } => !!p && !p.isError && typeof p.text === "string")
     .map((p) => p.text ?? "");
   return texts.join("\n").trim();
 }
@@ -277,13 +232,16 @@ export interface CleanContextRunnerOptions {
    * automatically falls back to the main config's `agents.defaults.model`.
    */
   modelRef?: string;
-  /** Preferred runtime seam. When absent, falls back to the legacy dist bridge. */
-  agentRuntime?: EmbeddedAgentRuntimeLike;
+  /** Host plugin runtime seam (`api.runtime`). Required at run time. */
+  agentRuntime?: PluginRuntimeLike;
   /** Allow the LLM to use tools (read_file, write_to_file, etc). Default: false */
   enableTools?: boolean;
   /** Logger instance for detailed tracing */
   logger?: RunnerLogger;
 }
+
+const DEFAULT_EXTRACTION_SYSTEM_PROMPT =
+  "You are a precise data extraction and generation assistant. Follow the user instructions exactly. Respond only with the requested output format.";
 
 // Stable empty directory used as default workspaceDir so that:
 // 1. Bootstrap/skills scans find nothing → clean LLM context
@@ -331,7 +289,7 @@ export class CleanContextRunner {
           `${TAG} Using model from main config: ${fromConfig.provider}/${fromConfig.model}`,
         );
       }
-      // else: both undefined → core will use its built-in default (anthropic/claude-opus-4-6)
+      // else: both undefined → core will use its built-in default
     }
   }
 
@@ -339,12 +297,13 @@ export class CleanContextRunner {
    * Run a prompt in a fully isolated clean context.
    * Returns the LLM's text output.
    *
-   * When `workspaceDir` is provided it overrides the default `process.cwd()`,
-   * letting the LLM's file-tool calls resolve paths relative to a custom root.
+   * When `workspaceDir` is provided it overrides the default clean workspace,
+   * letting the LLM's file-tool calls resolve paths relative to a custom root
+   * (embedded-agent path only).
    */
   async run(params: {
     prompt: string;
-    /** Optional system prompt. When provided, `prompt` is used as the user message. */
+    /** Task-specific system prompt. Defaults to a generic extraction prompt. */
     systemPrompt?: string;
     taskId: string;
     timeoutMs?: number;
@@ -354,212 +313,194 @@ export class CleanContextRunner {
     instanceId?: string;
   }): Promise<string> {
     const runStartMs = Date.now();
-    this.logger?.debug?.(`${TAG} run() start: taskId=${params.taskId}, timeout=${params.timeoutMs ?? 120_000}ms, tools=${this.options.enableTools ? "enabled" : "disabled"}, workspaceDir=${params.workspaceDir ?? "(default)"}`);
-
-    const tmpDir = await fs.mkdtemp(
-      path.join(resolveOpenClawTmpDir(), `memory-tdai-${params.taskId}-`),
+    const timeoutMs = params.timeoutMs ?? 120_000;
+    const systemPrompt = params.systemPrompt || DEFAULT_EXTRACTION_SYSTEM_PROMPT;
+    this.logger?.debug?.(
+      `${TAG} run() start: taskId=${params.taskId}, timeout=${timeoutMs}ms, ` +
+      `tools=${this.options.enableTools ? "enabled" : "disabled"}, ` +
+      `model=${this.resolvedModel ? `${this.resolvedProvider ?? "(default)"}/${this.resolvedModel}` : "(default)"}`,
     );
-    const cleanWorkspace = params.workspaceDir ?? await getCleanWorkspaceDir();
-    this.logger?.debug?.(`${TAG} run() tmpDir=${tmpDir}, cleanWorkspace=${cleanWorkspace}`);
+
+    const runtime = resolveRuntime(this.options.agentRuntime);
+    if (!runtime) {
+      throw new Error(
+        `${TAG} No OpenClaw plugin runtime available for LLM calls ` +
+        `(runtime.llm.complete / runtime.agent.runEmbeddedAgent missing). ` +
+        `Ensure the plugin runs inside a current OpenClaw host, or configure the ` +
+        `standalone LLM override (llm.enabled + llm.apiKey) in the memory-tdai config.`,
+      );
+    }
 
     try {
-      const sessionFile = path.join(tmpDir, "session.json");
-
-      // Phase 1: Resolve runEmbeddedPiAgent (prefer runtime, fallback to legacy dist bridge)
-      const importStartMs = Date.now();
-      const runEmbeddedPiAgent = await resolveRunEmbeddedPiAgent(
-        this.options.agentRuntime,
-        this.logger,
-      );
-      const importElapsedMs = Date.now() - importStartMs;
-      this.logger?.debug?.(`${TAG} run() runner resolution phase: ${importElapsedMs}ms`);
-
-      // Derive a config with plugins disabled to prevent loadOpenClawPlugins
-      // from re-registering plugins when the workspaceDir differs from the
-      // gateway's original workspace (cacheKey mismatch triggers full reload).
-      //
-      // Security: restrict available tools to the minimal set needed for
-      // scene extraction (read/write/edit). This prevents the LLM from
-      // accessing exec, sessions, browser, cron, or any other powerful tools.
-      // File deletion is handled via "soft-delete" (write empty) + cleanup afterward.
-      const cleanConfig = {
-        ...(this.options.config as Record<string, unknown>),
-        plugins: {
-          ...((this.options.config as Record<string, unknown>)?.plugins as Record<string, unknown> | undefined),
-          enabled: false,
-        },
-        tools: {
-          ...((this.options.config as Record<string, unknown>)?.tools as Record<string, unknown> | undefined),
-          // When enableTools=true, restrict to the minimal set needed for
-          // scene extraction (read/write/edit).
-          // When enableTools=false, pass an empty allow list — disableTools:true
-          // will prevent tools from being sent to the API entirely.
-          allow: this.options.enableTools ? ["read", "write", "edit"] : [],
-        },
-        // Override the full agent system prompt with the caller's extraction-specific
-        // system prompt. This replaces OpenClaw's default system prompt (identity,
-        // AGENTS.md, workspace context, tool guidance, etc.) to:
-        //   1. Save ~5000 tokens per LLM call
-        //   2. Avoid instruction interference with extraction prompts
-        agents: {
-          ...((this.options.config as Record<string, unknown>)?.agents as Record<string, unknown> | undefined),
-          defaults: {
-            ...(((this.options.config as Record<string, unknown>)?.agents as Record<string, unknown> | undefined)?.defaults as Record<string, unknown> | undefined),
-            systemPromptOverride:
-              params.systemPrompt ||
-              "You are a precise data extraction and generation assistant. Follow the user instructions exactly. Respond only with the requested output format.",
-          },
-        },
-      };
-
-      // systemPrompt is now in config.agents.defaults.systemPromptOverride
-      // (actual [system] role), so user prompt only contains the actual content.
-      const effectivePrompt = params.prompt;
-
-      const ts = Date.now();
-      const sessionId = `memory-${params.taskId}-session-${ts}`;
-      const runId = `memory-${params.taskId}-run-${ts}`;
-      this.logger?.debug?.(`${TAG} run() starting embedded agent: sessionId=${sessionId}, runId=${runId}, provider=${this.resolvedProvider ?? "(default)"}, model=${this.resolvedModel ?? "(default)"}`);
-
-      // [l1-debug] INVOKE — what are we about to send to the embedded agent?
-      const sysPromptOverrideLen =
-        ((cleanConfig.agents as Record<string, unknown> | undefined)?.defaults as Record<string, unknown> | undefined)?.systemPromptOverride
-          ? String(
-              ((cleanConfig.agents as Record<string, unknown>).defaults as Record<string, unknown>).systemPromptOverride,
-            ).length
-          : 0;
-      const toolsAllow =
-        ((cleanConfig.tools as Record<string, unknown> | undefined)?.allow as unknown[] | undefined) ?? [];
-      this.logger?.debug?.(
-        `${TAG} [l1-debug] INVOKE taskId=${params.taskId}, provider=${this.resolvedProvider ?? "(default)"}, model=${this.resolvedModel ?? "(default)"}, promptLen=${effectivePrompt.length}, sysPromptOverrideLen=${sysPromptOverrideLen}, toolsAllow=${JSON.stringify(toolsAllow)}, timeoutMs=${params.timeoutMs ?? 120_000}`,
-      );
-
-      // Phase 2: Embedded agent run (LLM call + tool calls)
-      const agentStartMs = Date.now();
-      // extraSystemPrompt: fallback for openclaw < 2026.4.7 which does not support
-      // config.agents.defaults.systemPromptOverride. On newer versions the
-      // override takes precedence and this becomes a no-op append.
-      const effectiveSystemPrompt =
-        params.systemPrompt ||
-        "You are a precise data extraction and generation assistant. Follow the user instructions exactly. Respond only with the requested output format.";
-      const result = await runEmbeddedPiAgent({
-        sessionId,
-        sessionFile,
-        workspaceDir: cleanWorkspace,
-        config: cleanConfig,
-        prompt: effectivePrompt,
-        timeoutMs: params.timeoutMs ?? 120_000,
-        runId,
-        provider: this.resolvedProvider,
-        model: this.resolvedModel,
-        // When enableTools=false, pass disableTools:true so that no tool
-        // definitions are sent to the API. This avoids polluting the LLM
-        // context with tool schemas and prevents the model from attempting
-        // tool calls during pure text extraction tasks.
-        // If a provider (e.g. qwencode) rejects empty tools[], users should
-        // switch to StandaloneLLMRunner via LLM configuration instead.
-        disableTools: !this.options.enableTools,
-        extraSystemPrompt: effectiveSystemPrompt,
-        streamParams: {
-          maxTokens: params.maxTokens,
-        },
-      });
-      const agentElapsedMs = Date.now() - agentStartMs;
-      this.logger?.debug?.(`${TAG} run() embedded agent completed: ${agentElapsedMs}ms`);
-
-      // [l1-debug] RESULT — what did the embedded agent return?
-      {
-        const payloadsRaw = (result as Record<string, unknown> | undefined)?.payloads;
-        const payloads = Array.isArray(payloadsRaw)
-          ? (payloadsRaw as Array<Record<string, unknown>>)
-          : [];
-        const payloadKinds = payloads.map((p) => {
-          if (typeof p?.type === "string") return p.type as string;
-          if (typeof p?.kind === "string") return p.kind as string;
-          return Object.keys(p ?? {}).slice(0, 3).join("|") || "unknown";
-        });
-        const errorPayloadCount = payloads.filter((p) => p?.isError === true).length;
-        const joinedText = payloads
-          .filter((p) => !p?.isError && typeof p?.text === "string")
-          .map((p) => String(p.text ?? ""))
-          .join("\n");
-        const textPreview = joinedText.replace(/\s+/g, " ").slice(0, 200);
-        this.logger?.debug?.(
-          `${TAG} [l1-debug] RESULT taskId=${params.taskId}, elapsedMs=${agentElapsedMs}, payloadCount=${payloads.length}, payloadKinds=${JSON.stringify(payloadKinds)}, errorPayloadCount=${errorPayloadCount}, textLen=${joinedText.length}, textPreview=${JSON.stringify(textPreview)}`,
+      let text: string;
+      if (!this.options.enableTools && typeof runtime.llm?.complete === "function") {
+        text = await this.runIsolatedCompletion(runtime, { ...params, systemPrompt, timeoutMs });
+      } else if (typeof runtime.agent?.runEmbeddedAgent === "function") {
+        text = await this.runEmbeddedAgent(runtime, { ...params, systemPrompt, timeoutMs });
+      } else {
+        throw new Error(
+          `${TAG} OpenClaw runtime does not expose ${
+            this.options.enableTools ? "agent.runEmbeddedAgent" : "llm.complete"
+          }; cannot run taskId=${params.taskId}. Configure the standalone LLM override ` +
+          `(llm.enabled + llm.apiKey) in the memory-tdai config.`,
         );
       }
 
-      // Phase 3: Collect output
-      const text = collectText((result as Record<string, unknown>).payloads as Array<{ text?: string; isError?: boolean }> | undefined);
       const totalMs = Date.now() - runStartMs;
 
       if (!text) {
         // Empty output is normal when the LLM decides there is nothing to
         // extract (e.g. trivial greetings).  Log a warning instead of
         // throwing so the caller can handle it gracefully.
-        this.logger?.warn?.(`${TAG} run() empty output after ${totalMs}ms (import=${importElapsedMs}ms, agent=${agentElapsedMs}ms) — treating as empty result`);
-        // [l1-debug] EMPTY_DUMP — dump the full result shape so we can see where text went
-        try {
-          const dump = JSON.stringify(result, (_k, v) => {
-            if (typeof v === "string" && v.length > 500) return v.slice(0, 500) + `…(+${v.length - 500})`;
-            return v;
-          }).slice(0, 2048);
-          this.logger?.warn?.(`${TAG} [l1-debug] EMPTY_DUMP taskId=${params.taskId}, resultJson=${dump}`);
-        } catch (dumpErr) {
-          this.logger?.warn?.(`${TAG} [l1-debug] EMPTY_DUMP taskId=${params.taskId}, dumpFailed=${dumpErr instanceof Error ? dumpErr.message : String(dumpErr)}`);
-        }
-        // llm_call metric (empty output)
-        if (params.instanceId && this.logger) {
-          report("llm_call", {
-            taskId: params.taskId,
-            provider: this.resolvedProvider ?? "default",
-            model: this.resolvedModel ?? "default",
-            inputLength: params.prompt.length,
-            outputLength: 0,
-            totalDurationMs: totalMs,
-            success: true,
-            error: "empty_output",
-          });
-        }
+        this.logger?.warn?.(
+          `${TAG} run() empty output after ${totalMs}ms — treating as empty result`,
+        );
+        this.reportMetric(params, totalMs, 0, true, "empty_output");
         return "";
       }
 
-      this.logger?.debug?.(`${TAG} run() completed: ${totalMs}ms total (import=${importElapsedMs}ms, agent=${agentElapsedMs}ms), output=${text.length} chars`);
-
-      // ── llm_call metric (success) ──
-      if (params.instanceId && this.logger) {
-        report("llm_call", {
-          taskId: params.taskId,
-          provider: this.resolvedProvider ?? "default",
-          model: this.resolvedModel ?? "default",
-          inputLength: params.prompt.length,
-          outputLength: text.length,
-          totalDurationMs: totalMs,
-          success: true,
-          error: null,
-        });
-      }
-
+      this.logger?.debug?.(
+        `${TAG} run() completed: ${totalMs}ms total, output=${text.length} chars`,
+      );
+      this.reportMetric(params, totalMs, text.length, true, null);
       return text;
     } catch (err) {
       const totalMs = Date.now() - runStartMs;
-      this.logger?.error(`${TAG} run() failed after ${totalMs}ms: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
-      // ── llm_call metric (failure) ──
-      if (params.instanceId && this.logger) {
-        report("llm_call", {
-          taskId: params.taskId,
-          provider: this.resolvedProvider ?? "default",
-          model: this.resolvedModel ?? "default",
-          inputLength: params.prompt.length,
-          outputLength: 0,
-          totalDurationMs: totalMs,
-          success: false,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
+      this.logger?.error(
+        `${TAG} run() failed after ${totalMs}ms: ${err instanceof Error ? err.stack ?? err.message : String(err)}`,
+      );
+      this.reportMetric(params, totalMs, 0, false, err instanceof Error ? err.message : String(err));
       throw err;
-    } finally {
-      await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     }
+  }
+
+  /** L1 path: fresh zero-tool completion with full system-prompt control. */
+  private async runIsolatedCompletion(
+    runtime: PluginRuntimeLike,
+    params: {
+      prompt: string;
+      systemPrompt: string;
+      taskId: string;
+      timeoutMs: number;
+      maxTokens?: number;
+    },
+  ): Promise<string> {
+    const modelRef =
+      this.resolvedProvider && this.resolvedModel
+        ? `${this.resolvedProvider}/${this.resolvedModel}`
+        : undefined;
+    this.logger?.debug?.(
+      `${TAG} [l1-debug] INVOKE llm.complete taskId=${params.taskId}, ` +
+      `model=${modelRef ?? "(default)"}, promptLen=${params.prompt.length}, ` +
+      `sysPromptLen=${params.systemPrompt.length}, timeoutMs=${params.timeoutMs}`,
+    );
+
+    const result = await runtime.llm!.complete!({
+      messages: [{ role: "user", content: params.prompt }],
+      systemPrompt: params.systemPrompt,
+      ...(modelRef ? { model: modelRef } : {}),
+      ...(params.maxTokens ? { maxTokens: params.maxTokens } : {}),
+      purpose: `memory-tdai:${params.taskId}`,
+      execution: {
+        mode: "isolated-agent-runtime",
+        timeoutMs: params.timeoutMs,
+      },
+    });
+
+    return (result.text ?? "").trim();
+  }
+
+  /** L2 path: embedded agent run with a restricted, sandboxed tool set. */
+  private async runEmbeddedAgent(
+    runtime: PluginRuntimeLike,
+    params: {
+      prompt: string;
+      systemPrompt: string;
+      taskId: string;
+      timeoutMs: number;
+      maxTokens?: number;
+      workspaceDir?: string;
+    },
+  ): Promise<string> {
+    const workspaceDir = params.workspaceDir ?? (await getCleanWorkspaceDir());
+
+    // Derive a config with plugins disabled to prevent loadOpenClawPlugins
+    // from re-registering plugins when the workspaceDir differs from the
+    // gateway's original workspace (cacheKey mismatch triggers full reload).
+    //
+    // Security: restrict available tools to the minimal set needed for
+    // scene extraction (read/write/edit). This prevents the LLM from
+    // accessing exec, sessions, browser, cron, or any other powerful tools.
+    const baseConfig = (this.options.config as Record<string, unknown>) ?? {};
+    const cleanConfig = {
+      ...baseConfig,
+      plugins: {
+        ...(baseConfig.plugins as Record<string, unknown> | undefined),
+        enabled: false,
+      },
+      tools: {
+        ...(baseConfig.tools as Record<string, unknown> | undefined),
+        // When enableTools=true, restrict to the minimal set needed for
+        // scene extraction (read/write/edit).
+        // When enableTools=false, pass an empty allow list — disableTools:true
+        // will prevent tools from being sent to the API entirely.
+        allow: this.options.enableTools ? ["read", "write", "edit"] : [],
+      },
+    };
+
+    const ts = Date.now();
+    const sessionId = `memory-${params.taskId}-session-${ts}`;
+    const sessionKey = sessionId; // fresh unique key → blank transcript
+    const runId = `memory-${params.taskId}-run-${ts}`;
+
+    this.logger?.debug?.(
+      `${TAG} [l1-debug] INVOKE runEmbeddedAgent taskId=${params.taskId}, ` +
+      `sessionId=${sessionId}, provider=${this.resolvedProvider ?? "(default)"}, ` +
+      `model=${this.resolvedModel ?? "(default)"}, promptLen=${params.prompt.length}, ` +
+      `extraSystemPromptLen=${params.systemPrompt.length}, workspaceDir=${workspaceDir}, ` +
+      `timeoutMs=${params.timeoutMs}`,
+    );
+
+    const result = await runtime.agent!.runEmbeddedAgent!({
+      sessionId,
+      sessionKey,
+      runId,
+      workspaceDir,
+      config: cleanConfig,
+      prompt: params.prompt,
+      timeoutMs: params.timeoutMs,
+      ...(this.resolvedProvider ? { provider: this.resolvedProvider } : {}),
+      ...(this.resolvedModel ? { model: this.resolvedModel } : {}),
+      // When enableTools=false, pass disableTools:true so that no tool
+      // definitions are sent to the API.
+      disableTools: !this.options.enableTools,
+      extraSystemPrompt: params.systemPrompt,
+      streamParams: {
+        maxTokens: params.maxTokens,
+      },
+      trigger: "memory",
+    });
+
+    return collectText(result?.payloads);
+  }
+
+  private reportMetric(
+    params: { taskId: string; prompt: string; instanceId?: string },
+    totalDurationMs: number,
+    outputLength: number,
+    success: boolean,
+    error: string | null,
+  ): void {
+    if (!params.instanceId) return;
+    report("llm_call", {
+      taskId: params.taskId,
+      provider: this.resolvedProvider ?? "default",
+      model: this.resolvedModel ?? "default",
+      inputLength: params.prompt.length,
+      outputLength,
+      totalDurationMs,
+      success,
+      error,
+    });
   }
 }

@@ -491,7 +491,7 @@ export class MemoryPipelineManager {
   /**
    * Graceful shutdown with timeout protection:
    * 1. Mark destroyed, stop accepting new work
-   * 2. Attempt to flush pending L1/L2/L3 work within DESTROY_TIMEOUT_MS
+   * 2. Attempt to flush pending L1/L2 work within DESTROY_TIMEOUT_MS
    * 3. If flush times out or fails, persist current state for recovery on next startup
    * 4. Pending work is never lost — it will be recovered via checkpoint on next start()
    */
@@ -536,7 +536,7 @@ export class MemoryPipelineManager {
   }
 
   /**
-   * Internal: attempt to flush all pending pipeline work (L1 → L2 → L3).
+   * Internal: attempt to flush all pending pipeline work (L1 → L2).
    * Extracted from destroy() so it can be wrapped with a timeout.
    */
   private async _doFlush(): Promise<void> {

@@ -45,15 +45,12 @@ openclaw plugins install --link .
 │   ├── conversation/        # L0 Conversation layer — raw dialogue capture
 │   ├── record/              # L1 Record layer — structured information extraction
 │   ├── scene/               # L2 Scene layer — scene summarization & aggregation
-│   ├── persona/             # L3 Persona layer — user profile construction
 │   ├── store/               # Storage layer — SQLite / vector database
 │   ├── hooks/               # OpenClaw hooks integration
 │   ├── prompts/             # LLM prompt templates
 │   ├── tools/               # Tool functions
 │   ├── utils/               # General utilities
 │   └── report/              # Health check & reporting
-├── hermes-plugin/           # Hermes agent plugin adapter
-├── scripts/                 # Helper scripts (Gateway control, etc.)
 ├── CHANGELOG.md             # Changelog
 └── README.md                # Project documentation
 ```
