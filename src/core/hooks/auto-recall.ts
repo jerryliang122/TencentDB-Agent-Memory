@@ -6,7 +6,7 @@
  *   - keyword: FTS5 BM25 (requires FTS5; returns empty if unavailable)
  *   - embedding: VectorStore cosine similarity
  *   - hybrid: keyword + embedding merged with RRF
- * - L3 active scenes (top-K most-recently-updated summaries)
+ * - Active scenes (top-K most-recently-updated summaries)
  */
 
 import { formatForLLM } from "../../utils/time.js";
@@ -44,7 +44,7 @@ const MEMORY_TOOLS_GUIDE = `<memory-tools-guide>
   参数：query（关键词或自然语言描述）、可选 limit/type/scene 过滤。
 - **tdai_conversation_search**：搜索原始对话（L0）。
   适用于查找具体消息原文、时间线、上下文细节；也可用于补充或校验 memory_search 的结果。
-- **read_file**（scene_blocks/<title>.md）：当上方 <active-scenes> 中某场景看起来相关、需要完整画像、事件经过或阶段结论时使用。按场景标题构造路径：scene_blocks/<title>.md
+- **read_file**(scene_blocks/<title>.md):读取 <active-scenes> 中某场景的记忆指针列表,了解该主题覆盖哪些 L1 记忆。按场景标题构造路径:scene_blocks/<title>.md
 
 ### ⚠️ 调用次数限制
 每轮对话中，tdai_memory_get / tdai_memory_search / tdai_conversation_search **合计最多调用 5 次**。
@@ -69,9 +69,6 @@ export interface RecallResult {
   // ── Metric payload (for pendingRecallCache in index.ts) ──
   /** L1 memories that were recalled (with scores), for metric reporting */
   recalledL1Memories?: RecalledMemory[];
-  /** @deprecated L3 persona injection removed in redesign; always null. Field
-   *  retained for backward-compat with metric consumers in index.ts. */
-  recalledL3Persona?: string | null;
   /** Effective search strategy used */
   recallStrategy?: string;
 }
@@ -165,12 +162,13 @@ async function performAutoRecallInner(params: {
   }
   const tSearchEnd = performance.now();
 
-  // L3 persona injection removed in redesign — persona.md auto-generation
-  // is disabled. User profile is owned by AGENTS.md / IDENTITY.md / USER.md.
+  // Persona.md auto-generation is disabled in redesign.
+  // User profile is owned by AGENTS.md / IDENTITY.md / USER.md.
   const tPersonaStart = performance.now();
   const tPersonaEnd = tPersonaStart;
 
-  // Load top-K active scenes (L2/L3 layer — recent activity context)
+  // Load active scenes: every theme whose last_active is within TTL,
+  // sorted by recency, no count cap (TTL alone bounds the list).
   const tSceneStart = performance.now();
   let activeScenesText: string | undefined;
   try {
@@ -178,11 +176,10 @@ async function performAutoRecallInner(params: {
     if (sceneIndex.length > 0) {
       activeScenesText = generateActiveScenes(
         sceneIndex,
-        cfg.persona.l3InjectTopK,
-        cfg.persona.l3InjectSummaryChars,
+        cfg.persona.sceneTtlDays,
       );
       logger?.debug?.(
-        `${TAG} Active scenes generated: top-${cfg.persona.l3InjectTopK} of ${sceneIndex.length}`,
+        `${TAG} Active scenes generated: ${sceneIndex.length} indexed, ttl=${cfg.persona.sceneTtlDays}d`,
       );
     }
   } catch {
@@ -215,7 +212,9 @@ async function performAutoRecallInner(params: {
   //   so it doesn't bust the system prompt cache.
   const stableParts: string[] = [];
   if (activeScenesText) {
-    stableParts.push(`<active-scenes>\n${activeScenesText}\n</active-scenes>`);
+    stableParts.push(
+      `<active-scenes>\n以下是当前活跃的工作主题(标题 + 活动时间 + 一句话现状;长期未活动的主题已自动移除):\n\n${activeScenesText}\n</active-scenes>`,
+    );
   }
 
   // Dynamic part: L1 relevant memories (changes every turn) → prependContext (user prompt)
@@ -251,7 +250,6 @@ async function performAutoRecallInner(params: {
     prependContext,
     appendSystemContext,
     recalledL1Memories,
-    recalledL3Persona: null, // L3 persona disabled in redesign
     recallStrategy: effectiveStrategy,
   };
 }
@@ -347,7 +345,11 @@ async function searchMemories(
   }
 
   const maxResults = cfg.recall.maxResults ?? 5;
-  const threshold = cfg.recall.scoreThreshold ?? 0.3;
+  const threshold = cfg.recall.scoreThreshold ?? 0.5;
+  // FTS scores are on the bm25RankToScore scale, NOT cosine — a separate,
+  // wider threshold avoids over-filtering keyword hits when the vector
+  // threshold is tightened (see config.ts ftsScoreThreshold docs).
+  const ftsThreshold = cfg.recall.ftsScoreThreshold ?? 0.35;
 
   // Build format options from config — drives subject-only injection mode.
   const formatOpts: FormatLineOptions = {
@@ -384,7 +386,7 @@ async function searchMemories(
   try {
     if (effectiveStrategy === "keyword") {
       const tFts = performance.now();
-      const lines = await searchByKeyword(cleanText, pluginDataDir, maxResults, threshold, logger, vectorStore, formatOpts);
+      const lines = await searchByKeyword(cleanText, pluginDataDir, maxResults, ftsThreshold, logger, vectorStore, formatOpts);
       return { lines, timing: { ftsMs: performance.now() - tFts, embeddingMs: 0, ftsHits: lines.length, embeddingHits: 0 } };
     }
 
@@ -399,15 +401,15 @@ async function searchMemories(
     // to avoid a redundant second HTTP request and a wasted local embed().
     if (vectorStore?.getCapabilities().nativeHybridSearch) {
       const tNative = performance.now();
-      const rawResults = await vectorStore.searchL1Hybrid({ query: cleanText, topK: maxResults });
+      const rawResults = await vectorStore.searchL1Hybrid?.({ query: cleanText, topK: maxResults });
       const nativeMs = performance.now() - tNative;
       // Client-side backstop: TCVDB does server-side dense+sparse+RRF merge,
       // but may not honor the user's configured scoreThreshold. Filter here
       // as the last line of defense so weak server-merged candidates don't
       // get injected when the user set a stricter threshold.
-      const results = rawResults.filter((r) => r.score >= threshold);
+      const results = (rawResults ?? []).filter((r) => r.score >= threshold);
       logger?.debug?.(
-        `${TAG} [hybrid-native] ${rawResults.length} -> ${results.length} results after threshold=${threshold} filter (${nativeMs.toFixed(0)}ms)`,
+        `${TAG} [hybrid-native] ${rawResults?.length ?? 0} -> ${results.length} results after threshold=${threshold} filter (${nativeMs.toFixed(0)}ms)`,
       );
       if (results.length === 0) {
         return { lines: [], timing: { ftsMs: 0, embeddingMs: nativeMs, ftsHits: 0, embeddingHits: 0 } };
@@ -417,7 +419,7 @@ async function searchMemories(
     }
 
     // Fallback: run keyword + embedding in parallel, merge with client-side RRF (SQLite path)
-    return await searchHybrid(cleanText, pluginDataDir, maxResults, threshold, vectorStore!, embeddingService!, logger, embeddingCallOpts, formatOpts);
+    return await searchHybrid(cleanText, pluginDataDir, maxResults, threshold, ftsThreshold, vectorStore!, embeddingService!, logger, embeddingCallOpts, formatOpts);
   } catch (err) {
     logger?.warn?.(`${TAG} Memory search failed (strategy=${effectiveStrategy}): ${err instanceof Error ? err.message : String(err)}`);
     return emptyResult;
@@ -428,6 +430,10 @@ async function searchMemories(
 // Strategy: Keyword (FTS5 BM25, no in-memory fallback)
 // ============================
 
+/**
+ * Keyword search via FTS5 BM25. `threshold` is on the bm25RankToScore scale
+ * (NOT cosine) — callers pass cfg.recall.ftsScoreThreshold.
+ */
 async function searchByKeyword(
   userText: string,
   _pluginDataDir: string,
@@ -559,6 +565,10 @@ async function searchByEmbedding(
  * Hybrid search: run keyword (FTS5) and embedding in parallel, merge with
  * Reciprocal Rank Fusion (RRF) to combine rank lists.
  *
+ * `threshold` filters cosine scores (embedding side), `ftsThreshold` filters
+ * BM25-derived scores (keyword side) — the two scales are not comparable,
+ * see config.ts ftsScoreThreshold docs.
+ *
  * RRF score for a record at rank r = 1 / (k + r), where k=60 is a constant.
  * If a record appears in both lists, its RRF scores are summed.
  *
@@ -570,6 +580,7 @@ async function searchHybrid(
   _pluginDataDir: string,
   maxResults: number,
   threshold: number,
+  ftsThreshold: number,
   vectorStore: IMemoryStore,
   embeddingService: EmbeddingService,
   logger?: Logger,
@@ -588,12 +599,12 @@ async function searchHybrid(
         if (vectorStore.isFtsAvailable()) {
           const ftsQuery = buildFtsQuery(userText);
           if (ftsQuery) {
-            const ftsResults = await vectorStore.searchL1Fts(ftsQuery, candidateK);
-            if (ftsResults.length > 0) {
-              logger?.debug?.(`${TAG} [hybrid-keyword-fts] FTS5 found ${ftsResults.length} candidates`);
-              // Convert FtsSearchResult to ScoredRecord for RRF merge
-              const records = ftsResults
-                .filter((r) => r.score >= threshold)
+              const ftsResults = await vectorStore.searchL1Fts(ftsQuery, candidateK);
+              if (ftsResults.length > 0) {
+                logger?.debug?.(`${TAG} [hybrid-keyword-fts] FTS5 found ${ftsResults.length} candidates`);
+                // Convert FtsSearchResult to ScoredRecord for RRF merge
+                const records = ftsResults
+                  .filter((r) => r.score >= ftsThreshold)
                 .map((r): ScoredRecord => ({
                   record: {
                     id: r.record_id,

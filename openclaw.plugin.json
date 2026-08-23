@@ -2,7 +2,6 @@
   "id": "memory-tencentdb",
   "name": "Memory (TencentDB)",
   "description": "Three-layer memory system — auto-captures, structures, and summarizes conversational knowledge using local LLM + SQLite vector search",
-  "commandAliases": ["memory-tdai"],
   "activation": {
     "onStartup": true
   },
@@ -11,7 +10,7 @@
   },
   "configSchema": {
     "type": "object",
-    "additionalProperties": true,
+    "additionalProperties": false,
     "properties": {
       "timezone": {
         "type": "string",
@@ -53,8 +52,12 @@
           "sceneCreateThresholdMemories": { "type": "number", "default": 5, "description": "候选池提升阈值：累积 L1 记忆数" },
           "sceneCreateThresholdSessions": { "type": "number", "default": 3, "description": "候选池提升阈值：跨独立 session 数" },
           "sceneCandidateTtlDays": { "type": "number", "default": 30, "description": "候选池老化周期（天）" },
-          "l3InjectTopK": { "type": "number", "default": 5, "description": "L3 注入最近活跃 top-K 场景" },
-          "l3InjectSummaryChars": { "type": "number", "default": 150, "description": "L3 注入每场景 summary 字符上限" }
+          "sceneInjectTopK": { "type": "number", "default": 5, "description": "@deprecated v2 L2 注入全部 TTL 内活跃场景，不再截取 top-K" },
+          "sceneInjectSummaryChars": { "type": "number", "default": 150, "description": "@deprecated v2 L2 摘要上限改由 sceneSummaryMaxChars 控制" },
+          "sceneRoutingThreshold": { "type": "number", "default": 0.55, "description": "路由阈值:记忆向量与场景锚点余弦相似度达到该值才归入该场景(BGE-M3 平衡档;未匹配的记忆安全落入候选池)" },
+          "sceneSummaryMaxChars": { "type": "number", "default": 80, "description": "场景一句话现状摘要的硬性字符上限（工程强制）" },
+          "sceneSummaryRefreshDays": { "type": "number", "default": 7, "description": "摘要刷新周期（天）：有新记忆且距上次刷新超过该天数则重新生成" },
+          "sceneSummaryRefreshNewMemories": { "type": "number", "default": 5, "description": "摘要刷新触发阈值：累积新记忆达到该条数立即重新生成" }
         }
       },
       "pipeline": {
@@ -78,7 +81,8 @@
           "maxResults": { "type": "number", "default": 5, "description": "召回最大结果数" },
           "maxCharsPerMemory": { "type": "number", "default": 0, "description": "单条 L1 记忆注入的最大字符数；填 0 表示不限制" },
           "maxTotalRecallChars": { "type": "number", "default": 0, "description": "本轮 auto-recall 注入的 L1 记忆总字符预算；填 0 表示不限制" },
-          "scoreThreshold": { "type": "number", "default": 0.3, "description": "最低分数阈值" },
+          "scoreThreshold": { "type": "number", "default": 0.55, "description": "向量召回余弦相似度阈值(BGE-M3 校准:0.4-0.5 宽召回 / 0.5-0.6 平衡 / 0.6-0.7 精确;中文短文本建议 ≤0.6)" },
+          "ftsScoreThreshold": { "type": "number", "default": 0.35, "description": "FTS/BM25 路径的分数阈值(与余弦不同分度尺,不要与 scoreThreshold 混用;默认宽召回)" },
           "minQueryChars": { "type": "integer", "default": 6, "minimum": 0, "maximum": 500, "description": "触发 L1 记忆搜索所需的最小用户文本长度（按 sanitize 后的 Unicode code point 计，默认 6）。短于该阈值的应答词（如\"好的\"、\"嗯\"、\"ok\"、\"对\"）不携带语义意图，召回只会产生噪声，因此跳过 L1 搜索（active-scenes 仍照常注入）。设为 0 关闭该门控（不推荐）；设为 2 恢复历史最小行为" },
           "strategy": { "type": "string", "enum": ["embedding", "keyword", "hybrid"], "default": "hybrid", "description": "搜索策略：keyword(关键词)、embedding(向量)、hybrid(混合RRF融合，推荐)" },
           "timeoutMs": { "type": "number", "default": 5000, "description": "召回整体超时（毫秒），超时后跳过记忆注入并打印警告日志" },
@@ -108,7 +112,7 @@
       },
       "bm25": {
         "type": "object",
-        "description": "BM25 稀疏向量编码设置（主要用于 tcvdb 后端）",
+        "description": "BM25 稀疏向量编码设置（SQLite 后端使用）",
         "properties": {
           "enabled": { "type": "boolean", "default": true, "description": "是否启用 BM25 稀疏向量编码" },
           "language": { "type": "string", "enum": ["zh", "en"], "default": "zh", "description": "分词语言：zh（中文）或 en（英文）" }

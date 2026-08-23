@@ -223,7 +223,7 @@ export async function syncLocalProfilesToStore(
   }
 }
 
-export async function ensureL2L3Local(
+export async function ensureL2ProfilesLocal(
   dataDir: string,
   store: IMemoryStore,
   logger: Logger,

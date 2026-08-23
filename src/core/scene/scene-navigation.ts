@@ -1,8 +1,15 @@
 /**
- * Scene navigation: generates a summary navigation section appended to persona.md.
+ * Scene navigation: view builders over the scene index.
  *
- * The navigation includes **absolute** file paths so the agent can directly
- * use read_file for on-demand scene loading (progressive disclosure).
+ *   generateActiveScenes  — the system-prompt injection view: every scene
+ *                           whose last_active is within TTL, sorted by
+ *                           recency, unlimited count. Each entry carries
+ *                           title + activity range + one-line summary +
+ *                           pointer scale — the "current work themes"
+ *                           awareness signal.
+ *
+ *   generateSceneNavigation — full index listing (all fields, absolute
+ *                           paths) used by the L2 profile sync view.
  */
 
 import path from "node:path";
@@ -11,51 +18,28 @@ import type { SceneIndexEntry } from "./scene-index.js";
 const NAV_HEADER = "---\n## 🗺️ Scene Navigation (Scene Index)";
 
 const NAV_FOOTER = `📌 使用说明：
-- Path 是 scene block 的绝对路径，可直接使用 read_file 读取完整内容
-- 热度：该场景被记忆命中的累计次数，越高越重要
-- Summary：场景的核心要点摘要`;
+- Path 是 scene block 的绝对路径，可直接使用 read_file 读取记忆指针列表
+- 记忆详情请用 tdai_memory_search 按主题关键词检索（内容都在 L1）`;
 
-/**
- * Build a fire-emoji string based on heat value (visual priority cue for the agent).
- */
-function heatEmoji(heat: number): string {
-  if (heat >= 1000) return " 🔥🔥🔥🔥🔥";
-  if (heat >= 500) return " 🔥🔥🔥🔥";
-  if (heat >= 200) return " 🔥🔥🔥";
-  if (heat >= 100) return " 🔥🔥";
-  if (heat >= 50) return " 🔥";
-  return "";
-}
-
-/**
- * Generate the scene navigation Markdown section.
- *
- * @param entries - Scene index entries
- * @param dataDir - Absolute path to the plugin data directory; when provided,
- *                  scene paths are rendered as absolute paths so the agent can
- *                  call read_file directly without path concatenation.
- */
 export function generateSceneNavigation(entries: SceneIndexEntry[], dataDir?: string): string {
   if (entries.length === 0) return "";
 
-  const sorted = [...entries].sort((a, b) => b.heat - a.heat);
-
-  const blocks = sorted.map((e) => {
+  const blocks = entries.map((e) => {
     const scenePath = dataDir
       ? path.join(dataDir, "scene_blocks", e.filename)
       : `scene_blocks/${e.filename}`;
-    const pathLine = `### Path: ${scenePath}`;
-    const heatLine = `**热度**: ${e.heat}${heatEmoji(e.heat)}${e.updated ? ` | **更新**: ${e.updated}` : ""}`;
-    const summaryLine = `Summary: ${e.summary}`;
-    return `${pathLine}\n${heatLine}\n${summaryLine}`;
+    return [
+      `### Path: ${scenePath}`,
+      `**活动时间**: ${formatRange(e.first_active, e.last_active)}`,
+      `**记忆数**: ${e.memory_count}`,
+      `Summary: ${e.summary}`,
+    ].join("\n");
   });
 
-  return `${NAV_HEADER}\n*以下是当前场景记忆的索引，可根据需要 read_file 读取详细内容。*\n\n${blocks.join("\n\n")}\n\n${NAV_FOOTER}`;
+  return `${NAV_HEADER}\n*以下是当前场景记忆的索引，可根据需要 read_file 读取指针列表。*\n\n${blocks.join("\n\n")}\n\n${NAV_FOOTER}`;
 }
 
-/**
- * Strip the scene navigation section from persona content.
- */
+/** Strip the scene navigation section from persona content. */
 export function stripSceneNavigation(personaContent: string): string {
   const idx = personaContent.indexOf(NAV_HEADER);
   if (idx === -1) return personaContent;
@@ -63,50 +47,65 @@ export function stripSceneNavigation(personaContent: string): string {
 }
 
 /**
- * Generate a compact "active scenes" view for L3 system-prompt injection.
+ * The system-prompt "active work themes" view.
  *
- * Differs from generateSceneNavigation in three ways:
- *   1. Only the top-K most-recently-updated scenes (vs. all).
- *   2. Each entry's summary is truncated to `summaryChars` (vs. full).
- *   3. No absolute paths — main agent does not auto-read these; they're
- *      contextual awareness only.
- *
- * Sort key is `updated` (recency), NOT `heat`. Heat is shown for context
- * but does not affect inclusion.
+ * Filter: last_active within `ttlDays` (expired themes are noise — the
+ * agent doesn't need them). No top-K cap: TTL alone bounds the list, and
+ * a hard cap could evict a genuinely active theme.
  */
 export function generateActiveScenes(
   entries: SceneIndexEntry[],
-  topK: number,
-  summaryChars: number,
+  ttlDays: number,
+  now: Date = new Date(),
 ): string {
   if (entries.length === 0) return "";
 
-  const sorted = [...entries].sort((a, b) => {
-    const bt = new Date(b.updated).getTime();
-    const at = new Date(a.updated).getTime();
-    return (Number.isNaN(bt) ? 0 : bt) - (Number.isNaN(at) ? 0 : at);
-  });
-  const top = sorted.slice(0, Math.max(0, topK));
+  const cutoffMs = ttlDays > 0 ? now.getTime() - ttlDays * 86_400_000 : -Infinity;
+  const active = entries
+    .filter((e) => {
+      const ms = Date.parse(e.last_active || e.updated);
+      // Unknown timestamps: keep (can't age them safely) — TTL eviction on
+      // disk side is responsible for removing truly stale entries.
+      return !Number.isFinite(ms) || ms >= cutoffMs;
+    })
+    .sort((a, b) => tsMs(b) - tsMs(a));
+  if (active.length === 0) return "";
 
-  const blocks = top.map((e) => {
-    const title = e.filename.replace(/\.md$/, "");
-    const summary = truncateSummary(e.summary, summaryChars);
-    return `### ${title} (热度 ${e.heat})\n${summary}`;
+  const lines = active.map((e) => {
+    const range = formatRange(e.first_active, e.last_active);
+    const parts = [e.summary, e.memory_count > 0 ? `记忆: ${e.memory_count}条` : ""].filter(Boolean);
+    const detail = parts.join(" | ");
+    return detail
+      ? `- ${e.title} (${range})\n  ${detail}`
+      : `- ${e.title} (${range})`;
   });
+  return lines.join("\n");
+}
 
-  return blocks.join("\n\n");
+function tsMs(e: SceneIndexEntry): number {
+  const ms = Date.parse(e.last_active || e.updated);
+  return Number.isFinite(ms) ? ms : 0;
 }
 
 /**
- * Truncate a summary to `maxChars` Unicode code points, appending a single
- * ellipsis (U+2026) only when truncation actually occurs.
- *
- * Uses `Array.from` for accurate CJK truncation (matches the pattern in
- * `src/core/hooks/auto-recall.ts:truncateHint`).
+ * "2026-06-28 ~ 08-20" — year shown once unless the range crosses a year
+ * boundary relative to the start.
  */
-function truncateSummary(s: string, maxChars: number): string {
-  if (!s) return "";
-  const cps = Array.from(s);
-  if (cps.length <= maxChars) return s;
-  return `${cps.slice(0, maxChars).join("").trimEnd()}…`;
+function formatRange(first: string, last: string): string {
+  const f = dateOf(first);
+  const l = dateOf(last);
+  if (!f && !l) return "";
+  if (!f) return l!.full;
+  if (!l || l.full === f.full) return f.full;
+  return l.year === f.year ? `${f.full} ~ ${l.md}` : `${f.full} ~ ${l.full}`;
+}
+
+function dateOf(ts: string): { full: string; md: string; year: string } | null {
+  const ms = Date.parse(ts);
+  if (!Number.isFinite(ms)) return null;
+  const d = new Date(ms);
+  const yyyy = String(d.getFullYear());
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return { full: `${yyyy}-${mm}-${dd}`, md: `${mm}-${dd}`, year: yyyy };
 }
