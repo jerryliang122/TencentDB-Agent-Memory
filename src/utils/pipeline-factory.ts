@@ -16,7 +16,10 @@ import { MemoryPipelineManager } from "./pipeline-manager.js";
 import type { L2Runner } from "./pipeline-manager.js";
 import { SessionFilter } from "./session-filter.js";
 import { extractL1Memories } from "../core/record/l1-extractor.js";
-import { readConversationMessagesGroupedBySessionId } from "../core/conversation/l0-recorder.js";
+import {
+  readConversationMessagesGroupedBySessionId,
+  readConversationRecords,
+} from "../core/conversation/l0-recorder.js";
 import type { ConversationMessage } from "../core/conversation/l0-recorder.js";
 import { CheckpointManager } from "./checkpoint.js";
 import type { PipelineSessionState } from "./checkpoint.js";
@@ -28,6 +31,11 @@ import { pullProfilesToLocal, syncLocalProfilesToStore } from "../core/profile/p
 import type { Logger } from "../core/types.js";
 
 const TAG = "[memory-tdai] [pipeline-factory]";
+const L0_PAGE_SIZE = 50;
+// Keep runner chunks aligned with extractL1Memories' "new messages" window.
+// Passing a larger group would make the extractor treat only its last 10 messages
+// as new while the runner advances the cursor past the whole group.
+const L1_MESSAGE_BATCH_SIZE = 10;
 
 function supportsProfileSyncWrite(store?: IMemoryStore): boolean {
   return !!(store?.syncProfiles || store?.deleteProfiles);
@@ -282,102 +290,154 @@ export function createL1Runner(opts: {
     );
 
     try {
-      let groups: Array<{ sessionId: string; messages: ConversationMessage[] }>;
-      let maxRecordedAtMs = 0;
+      let cursor = runnerState.last_l1_cursor;
+      let totalMessages = 0;
+      let totalExtracted = 0;
+      let totalStored = 0;
+      let totalGroupBatches = 0;
+      let pageCount = 0;
+      let lastSceneName = runnerState.last_scene_name || undefined;
+      // JSONL is the authoritative capture write. Lock the source choice for
+      // the whole run so differing DB/JSONL timestamps cannot cause duplicates
+      // or cursor skips. DB is used only for sessions with no JSONL history.
+      const useJsonlSource = (
+        await readConversationRecords(sessionKey, pluginDataDir, logger, true)
+      ).length > 0;
 
-      if (vectorStore && !vectorStore.isDegraded()) {
-        const l1Cursor = runnerState.last_l1_cursor > 0
-          ? runnerState.last_l1_cursor
-          : undefined;
-        const dbGroups = await vectorStore.queryL0GroupedBySessionId(sessionKey, l1Cursor);
-        groups = dbGroups.map((g) => ({
-          sessionId: g.sessionId,
-          messages: g.messages.map((m) => ({
-            id: m.id,
-            role: m.role as "user" | "assistant",
-            content: m.content,
-            timestamp: m.timestamp,
-          })),
-        }));
-        // Compute max recordedAtMs across all groups for cursor advancement
-        for (const g of dbGroups) {
-          for (const m of g.messages) {
-            if (m.recordedAtMs > maxRecordedAtMs) maxRecordedAtMs = m.recordedAtMs;
+      // Drain all available L0 pages oldest-first. Each successful page is
+      // checkpointed independently so a later failure resumes at that boundary.
+      while (true) {
+        let groups: Array<{ sessionId: string; messages: ConversationMessage[] }>;
+        let maxRecordedAtMs = 0;
+
+        if (!useJsonlSource && vectorStore && !vectorStore.isDegraded()) {
+          const dbGroups = await vectorStore.queryL0GroupedBySessionId(
+            sessionKey,
+            cursor > 0 ? cursor : undefined,
+            L0_PAGE_SIZE,
+          );
+          groups = dbGroups.map((g) => ({
+            sessionId: g.sessionId,
+            messages: g.messages.map((m) => ({
+              id: m.id,
+              role: m.role as "user" | "assistant",
+              content: m.content,
+              timestamp: m.timestamp,
+            })),
+          }));
+          // Compute max recordedAtMs across all groups for cursor advancement
+          for (const g of dbGroups) {
+            for (const m of g.messages) {
+              if (m.recordedAtMs > maxRecordedAtMs) maxRecordedAtMs = m.recordedAtMs;
+            }
+          }
+          logger.debug?.(`${TAG} [l1] L0 data source: VectorStore DB`);
+        } else {
+          logger.debug?.(
+            `${TAG} [l1] L0 data source: JSONL files ` +
+            `${useJsonlSource ? "(authoritative)" : "(no DB source available)"}`,
+          );
+          const jsonlGroups = await readConversationMessagesGroupedBySessionId(
+            sessionKey,
+            pluginDataDir,
+            cursor || undefined,
+            logger,
+            L0_PAGE_SIZE,
+          );
+          groups = jsonlGroups.map((g) => ({
+            sessionId: g.sessionId,
+            messages: g.messages,
+          }));
+          // Compute max recordedAtMs from JSONL groups
+          for (const g of jsonlGroups) {
+            for (const m of g.messages) {
+              if (m.recordedAtMs > maxRecordedAtMs) maxRecordedAtMs = m.recordedAtMs;
+            }
           }
         }
-        logger.debug?.(`${TAG} [l1] L0 data source: VectorStore DB`);
-      } else {
-        logger.debug?.(`${TAG} [l1] L0 data source: JSONL files (VectorStore unavailable)`);
-        const jsonlGroups = await readConversationMessagesGroupedBySessionId(
-          sessionKey,
-          pluginDataDir,
-          runnerState.last_l1_cursor || undefined,
-          logger,
-          50,
+
+        if (groups.length === 0) {
+          break;
+        }
+        if (!Number.isFinite(maxRecordedAtMs) || maxRecordedAtMs <= cursor) {
+          throw new Error(
+            `L0 page cannot advance cursor: current=${cursor}, pageMax=${maxRecordedAtMs}`,
+          );
+        }
+
+        pageCount++;
+        const pageMessages = groups.reduce((sum, g) => sum + g.messages.length, 0);
+        let pageStored = 0;
+        logger.info(
+          `${TAG} [l1] Processing page ${pageCount}: ${pageMessages} L0 messages across ` +
+          `${groups.length} sessionId group(s) for session ${sessionKey}`,
         );
-        groups = jsonlGroups.map((g) => ({
-          sessionId: g.sessionId,
-          messages: g.messages,
-        }));
-        // Compute max recordedAtMs from JSONL groups
-        for (const g of jsonlGroups) {
-          for (const m of g.messages) {
-            if (m.recordedAtMs > maxRecordedAtMs) maxRecordedAtMs = m.recordedAtMs;
+
+        for (const group of groups) {
+          totalGroupBatches++;
+          logger.debug?.(
+            `${TAG} [l1] Group sessionId=${group.sessionId || "(empty)"}: ${group.messages.length} messages`,
+          );
+
+          for (let offset = 0; offset < group.messages.length; offset += L1_MESSAGE_BATCH_SIZE) {
+            const messages = group.messages.slice(offset, offset + L1_MESSAGE_BATCH_SIZE);
+            const l1Result = await extractL1Memories({
+              messages,
+              sessionKey,
+              sessionId: group.sessionId,
+              baseDir: pluginDataDir,
+              config,
+              options: {
+                maxMessagesPerExtraction: L1_MESSAGE_BATCH_SIZE,
+                enableDedup: cfg.extraction.enableDedup,
+                maxMemoriesPerSession: cfg.extraction.maxMemoriesPerSession,
+                model: cfg.extraction.model,
+                previousSceneName: lastSceneName,
+                vectorStore,
+                embeddingService,
+                conflictRecallTopK: cfg.embedding.conflictRecallTopK,
+                embeddingTimeoutMs: cfg.embedding.captureTimeoutMs ?? cfg.embedding.timeoutMs,
+                llmRunner,
+              },
+              logger,
+              instanceId: getInstanceId?.(),
+            });
+
+            if (!l1Result.success) {
+              throw new Error(
+                `L1 extraction reported failure (page=${pageCount}, ` +
+                `sessionId=${group.sessionId || "(empty)"}, offset=${offset})`,
+              );
+            }
+
+            totalExtracted += l1Result.extractedCount;
+            totalStored += l1Result.storedCount;
+            pageStored += l1Result.storedCount;
+            if (l1Result.lastSceneName) {
+              lastSceneName = l1Result.lastSceneName;
+            }
           }
         }
+
+        // Advance only after every chunk in this page completed successfully.
+        await checkpoint.markL1ExtractionComplete(
+          sessionKey,
+          pageStored,
+          maxRecordedAtMs,
+          lastSceneName,
+        );
+        cursor = maxRecordedAtMs;
+        totalMessages += pageMessages;
       }
 
-      if (groups.length === 0) {
+      if (totalMessages === 0) {
         logger.debug?.(`${TAG} [l1] No new L0 messages for session ${sessionKey}`);
         return { processedCount: 0 };
       }
 
-      const totalMessages = groups.reduce((sum, g) => sum + g.messages.length, 0);
       logger.info(
-        `${TAG} [l1] Processing ${totalMessages} L0 messages across ${groups.length} sessionId group(s) for session ${sessionKey}`,
-      );
-
-      let totalExtracted = 0;
-      let totalStored = 0;
-      let lastSceneName: string | undefined;
-
-      for (const group of groups) {
-        logger.debug?.(
-          `${TAG} [l1] Group sessionId=${group.sessionId || "(empty)"}: ${group.messages.length} messages`,
-        );
-
-        const l1Result = await extractL1Memories({
-          messages: group.messages,
-          sessionKey,
-          sessionId: group.sessionId,
-          baseDir: pluginDataDir,
-          config,
-          options: {
-            enableDedup: cfg.extraction.enableDedup,
-            maxMemoriesPerSession: cfg.extraction.maxMemoriesPerSession,
-            model: cfg.extraction.model,
-            previousSceneName: lastSceneName ?? (runnerState.last_scene_name || undefined),
-            vectorStore,
-            embeddingService,
-            conflictRecallTopK: cfg.embedding.conflictRecallTopK,
-            embeddingTimeoutMs: cfg.embedding.captureTimeoutMs ?? cfg.embedding.timeoutMs,
-            llmRunner,
-          },
-          logger,
-          instanceId: getInstanceId?.(),
-        });
-
-        totalExtracted += l1Result.extractedCount;
-        totalStored += l1Result.storedCount;
-        if (l1Result.lastSceneName) {
-          lastSceneName = l1Result.lastSceneName;
-        }
-      }
-
-      // Use maxRecordedAtMs (write time) as cursor — always positive, TCVDB-safe
-      await checkpoint.markL1ExtractionComplete(sessionKey, totalStored, maxRecordedAtMs || undefined, lastSceneName);
-      logger.info(
-        `${TAG} [l1] L1 complete: extracted=${totalExtracted}, stored=${totalStored} (${groups.length} group(s))`,
+        `${TAG} [l1] L1 complete: processed=${totalMessages}, extracted=${totalExtracted}, ` +
+        `stored=${totalStored} (${pageCount} page(s), ${totalGroupBatches} group batch(es))`,
       );
 
       return { processedCount: totalMessages };

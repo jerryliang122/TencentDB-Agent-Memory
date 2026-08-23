@@ -671,6 +671,7 @@ export class VectorStore implements IMemoryStore {
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_l0_session_id ON l0_conversations(session_id)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_l0_recorded ON l0_conversations(recorded_at)");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_l0_timestamp ON l0_conversations(timestamp)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_l0_session_recorded ON l0_conversations(session_key, recorded_at, record_id)");
 
     // L0 vector virtual table (cosine distance, same dimensions as L1) — deferred when dimensions=0
     if (this.dimensions > 0) {
@@ -715,23 +716,47 @@ export class VectorStore implements IMemoryStore {
       `);
     }
 
-    // L0 query statements for L1 runner (newest-first + LIMIT to bound memory)
+    // L0 query statements for L1 runner (oldest-first pages to drain backlog safely).
     // Sort/filter by recorded_at (write time) instead of timestamp (conversation time)
     // because L1 cursor uses recorded_at semantics. ISO 8601 string comparison preserves time order.
+    //
+    // The cursor stores only recorded_at, so a hard row LIMIT could split messages that
+    // share the boundary timestamp and make the remainder unreachable after advancement.
+    // Select the first `limit` rows, then include the entire boundary timestamp cohort.
     this.stmtL0QueryAll = this.db.prepare(`
+      WITH eligible AS (
+        SELECT record_id, session_key, session_id, role, message_text, recorded_at, timestamp
+        FROM l0_conversations
+        WHERE session_key = ?
+      ), boundary AS (
+        SELECT recorded_at
+        FROM eligible
+        ORDER BY recorded_at ASC, record_id ASC
+        LIMIT 1 OFFSET ?
+      )
       SELECT record_id, session_key, session_id, role, message_text, recorded_at, timestamp
-      FROM l0_conversations
-      WHERE session_key = ?
-      ORDER BY recorded_at DESC
-      LIMIT ?
+      FROM eligible
+      WHERE NOT EXISTS (SELECT 1 FROM boundary)
+         OR recorded_at <= (SELECT recorded_at FROM boundary)
+      ORDER BY recorded_at ASC, record_id ASC
     `);
 
     this.stmtL0QueryAfter = this.db.prepare(`
+      WITH eligible AS (
+        SELECT record_id, session_key, session_id, role, message_text, recorded_at, timestamp
+        FROM l0_conversations
+        WHERE session_key = ? AND recorded_at > ?
+      ), boundary AS (
+        SELECT recorded_at
+        FROM eligible
+        ORDER BY recorded_at ASC, record_id ASC
+        LIMIT 1 OFFSET ?
+      )
       SELECT record_id, session_key, session_id, role, message_text, recorded_at, timestamp
-      FROM l0_conversations
-      WHERE session_key = ? AND recorded_at > ?
-      ORDER BY recorded_at DESC
-      LIMIT ?
+      FROM eligible
+      WHERE NOT EXISTS (SELECT 1 FROM boundary)
+         OR recorded_at <= (SELECT recorded_at FROM boundary)
+      ORDER BY recorded_at ASC, record_id ASC
     `);
 
     this.stmtL0QueryMigrationCursor = this.db.prepare(`
@@ -1976,22 +2001,24 @@ export class VectorStore implements IMemoryStore {
       return [];
     }
     try {
-      // Query newest-first (DESC) with LIMIT, then reverse to chronological order
+      const pageSize = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : 50;
+      if (pageSize === 0) return [];
+      const boundaryOffset = pageSize - 1;
+
       let rows: Array<Record<string, unknown>>;
       if (afterRecordedAtMs && afterRecordedAtMs > 0) {
         // Convert epoch ms to ISO string for recorded_at comparison
         const afterRecordedAtIso = new Date(afterRecordedAtMs).toISOString();
-        rows = this.stmtL0QueryAfter.all(sessionKey, afterRecordedAtIso, limit) as Array<Record<string, unknown>>;
+        rows = this.stmtL0QueryAfter.all(sessionKey, afterRecordedAtIso, boundaryOffset) as Array<Record<string, unknown>>;
       } else {
-        rows = this.stmtL0QueryAll.all(sessionKey, limit) as Array<Record<string, unknown>>;
+        rows = this.stmtL0QueryAll.all(sessionKey, boundaryOffset) as Array<Record<string, unknown>>;
       }
 
       this.logger?.info(
         `${TAG} [L0-query] session=${sessionKey}, afterRecordedAtMs=${afterRecordedAtMs ?? "(all)"}, ` +
-        `limit=${limit}, returned ${rows.length} row(s)`,
+        `limit=${pageSize}, returned ${rows.length} row(s)`,
       );
 
-      // Reverse: SQL returns newest-first (DESC), callers expect chronological order
       return rows.map((r) => ({
         record_id: r.record_id as string,
         session_key: r.session_key as string,
@@ -2000,7 +2027,7 @@ export class VectorStore implements IMemoryStore {
         message_text: r.message_text as string,
         recorded_at: (r.recorded_at as string) || "",
         timestamp: (r.timestamp as number) || 0,
-      })).reverse();
+      }));
     } catch (err) {
       this.logger?.warn(
         `${TAG} [L0-query] FAILED (non-fatal, returning empty): ${err instanceof Error ? err.message : String(err)}`,
@@ -2046,14 +2073,18 @@ export class VectorStore implements IMemoryStore {
         });
       }
 
-      // Convert to array, sorted by earliest message timestamp
+      // Convert to array, sorted by earliest write timestamp (the L1 cursor basis).
       const groups: Array<{ sessionId: string; messages: Array<{ id: string; role: string; content: string; timestamp: number; recordedAtMs: number }> }> = [];
       for (const [sessionId, messages] of groupMap) {
         if (messages.length > 0) {
           groups.push({ sessionId, messages });
         }
       }
-      groups.sort((a, b) => a.messages[0].timestamp - b.messages[0].timestamp);
+      groups.sort((a, b) =>
+        a.messages[0].recordedAtMs - b.messages[0].recordedAtMs ||
+        a.messages[0].timestamp - b.messages[0].timestamp ||
+        a.sessionId.localeCompare(b.sessionId),
+      );
 
       this.logger?.info(
         `${TAG} [L0-query-grouped] session=${sessionKey}, afterRecordedAtMs=${afterRecordedAtMs ?? "(all)"}, ` +

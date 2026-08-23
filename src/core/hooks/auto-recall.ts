@@ -17,7 +17,7 @@ import type { MemoryRecord } from "../record/l1-reader.js";
 import type { IMemoryStore, L1SearchResult, L1FtsResult } from "../store/types.js";
 import { buildFtsQuery } from "../store/sqlite.js";
 import type { EmbeddingService, EmbeddingCallOptions } from "../store/embedding.js";
-import { sanitizeText } from "../../utils/sanitize.js";
+import { escapeXmlTags, sanitizeText } from "../../utils/sanitize.js";
 import type { Logger } from "../types.js";
 
 const TAG = "[memory-tdai] [recall]";
@@ -769,8 +769,16 @@ export interface FormatLineOptions {
 }
 
 export function formatMemoryLine(m: FormatableMemory, opts: FormatLineOptions): string {
+  // All persisted L1 fields are untrusted. Escape them before they enter the
+  // <relevant-memories> prompt boundary. escapeXmlTags is idempotent, so old
+  // records that already contain escaped boundary text are not double-escaped.
+  const type = escapeXmlTags(m.type);
+  const sceneName = m.scene_name ? escapeXmlTags(m.scene_name) : undefined;
+  const content = escapeXmlTags(m.content);
+  const recordId = escapeXmlTags(m.record_id);
+
   // 1. Type tag + optional scene name
-  const tag = m.scene_name ? `${m.type}|${m.scene_name}` : m.type;
+  const tag = sceneName ? `${type}|${sceneName}` : type;
 
   // 2. Time info — prefer activity_start/end range; fall back to timestamp as point-in-time
   const start = formatTimestamp(m.activity_start_time);
@@ -791,20 +799,20 @@ export function formatMemoryLine(m: FormatableMemory, opts: FormatLineOptions): 
   // 3. Branch on mode
   if (!opts.subjectOnly) {
     // Legacy mode: full content + time, no record_id suffix
-    return `- [${tag}] ${m.content}${timeInfo}`;
+    return `- [${tag}] ${content}${timeInfo}`;
   }
 
   // Subject-only mode: hint + record_id suffix
   const hintChars = opts.subjectHintChars ?? 60;
   let hint = "";
-  if (hintChars > 0 && m.content) {
+  if (hintChars > 0 && content) {
     // Normalize newlines to spaces so the bullet stays single-line
     // (production content frequently starts with "首行：\n\n【section】...")
-    const normalized = m.content.replace(/\s*\n\s*/g, " ");
+    const normalized = content.replace(/\s*\n\s*/g, " ");
     hint = ` ${truncateHint(normalized, hintChars)}`;
   }
 
-  return `- [${tag}]${hint}${timeInfo} [id=${m.record_id}]`;
+  return `- [${tag}]${hint}${timeInfo} [id=${recordId}]`;
 }
 
 /**

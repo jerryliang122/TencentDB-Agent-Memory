@@ -219,8 +219,9 @@ export async function extractL1Memories(params: {
   let storedRecords: MemoryRecord[];
 
   if (enableDedup) {
+    let decisions: DedupDecision[] | undefined;
     try {
-      const decisions = await batchDedup({
+      decisions = await batchDedup({
         memories: memoriesWithIds,
         config,
         logger,
@@ -231,7 +232,13 @@ export async function extractL1Memories(params: {
         embeddingTimeoutMs: options.embeddingTimeoutMs,
         llmRunner: options.llmRunner,
       });
+    } catch (err) {
+      logger?.warn?.(`${TAG} Batch dedup failed, storing all as new: ${err instanceof Error ? err.message : String(err)}`);
+    }
 
+    // Keep persistence outside the dedup fallback catch. A write failure must
+    // propagate so the runner preserves its L0 cursor for retry.
+    if (decisions) {
       storedRecords = await applyDecisions({
         memoriesWithIds,
         decisions,
@@ -242,8 +249,7 @@ export async function extractL1Memories(params: {
         vectorStore: options.vectorStore,
         embeddingService: options.embeddingService,
       });
-    } catch (err) {
-      logger?.warn?.(`${TAG} Batch dedup failed, storing all as new: ${err instanceof Error ? err.message : String(err)}`);
+    } else {
       storedRecords = await storeAllDirectly(memoriesWithIds, baseDir, sessionKey, sessionId, logger, options.vectorStore, options.embeddingService);
     }
   } else {
@@ -367,7 +373,7 @@ function parseExtractionResult(raw: string, logger?: Logger): SceneSegment[] {
       logger?.warn?.(
         `${TAG} [l1-debug] NO_JSON taskId=l1-extraction, rawLen=${raw.length}, cleanedLen=${cleaned.length}, rawFull=${JSON.stringify(rawPreview)}${raw.length > 2048 ? `…(+${raw.length - 2048})` : ""}`,
       );
-      return [];
+      throw new Error("No JSON array found in extraction response");
     }
 
     // Sanitize control characters inside JSON string literals that LLM may produce
@@ -375,36 +381,73 @@ function parseExtractionResult(raw: string, logger?: Logger): SceneSegment[] {
     const parsed = JSON.parse(sanitized) as unknown[];
 
     if (!Array.isArray(parsed)) {
-      logger?.warn?.(`${TAG} Extraction response is not an array`);
-      return [];
+      throw new Error("Extraction response is not an array");
     }
 
     const scenes: SceneSegment[] = [];
-    for (const item of parsed) {
-      if (!item || typeof item !== "object") continue;
+    for (let sceneIndex = 0; sceneIndex < parsed.length; sceneIndex++) {
+      const item = parsed[sceneIndex];
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        throw new Error(`Scene ${sceneIndex} must be an object`);
+      }
       const s = item as Record<string, unknown>;
+      if (typeof s.scene_name !== "string" || s.scene_name.trim().length === 0) {
+        throw new Error(`Scene ${sceneIndex} has an invalid scene_name`);
+      }
+      if (
+        !Array.isArray(s.message_ids) ||
+        !s.message_ids.every((id) => typeof id === "string")
+      ) {
+        throw new Error(`Scene ${sceneIndex} has invalid message_ids`);
+      }
+      if (!Array.isArray(s.memories)) {
+        throw new Error(`Scene ${sceneIndex} has invalid memories`);
+      }
+
+      const memories = s.memories.map((itemMemory, memoryIndex) => {
+        if (!itemMemory || typeof itemMemory !== "object" || Array.isArray(itemMemory)) {
+          throw new Error(`Scene ${sceneIndex} memory ${memoryIndex} must be an object`);
+        }
+        const memory = itemMemory as Record<string, unknown>;
+        if (typeof memory.content !== "string" || memory.content.trim().length === 0) {
+          throw new Error(`Scene ${sceneIndex} memory ${memoryIndex} has invalid content`);
+        }
+        if (typeof memory.type !== "string" || normalizeType(memory.type) === null) {
+          throw new Error(`Scene ${sceneIndex} memory ${memoryIndex} has invalid type`);
+        }
+        if (typeof memory.priority !== "number" || !Number.isFinite(memory.priority)) {
+          throw new Error(`Scene ${sceneIndex} memory ${memoryIndex} has invalid priority`);
+        }
+        if (
+          !Array.isArray(memory.source_message_ids) ||
+          !memory.source_message_ids.every((id) => typeof id === "string")
+        ) {
+          throw new Error(`Scene ${sceneIndex} memory ${memoryIndex} has invalid source_message_ids`);
+        }
+        if (!memory.metadata || typeof memory.metadata !== "object" || Array.isArray(memory.metadata)) {
+          throw new Error(`Scene ${sceneIndex} memory ${memoryIndex} has invalid metadata`);
+        }
+
+        return {
+          content: memory.content,
+          type: memory.type,
+          priority: memory.priority,
+          source_message_ids: memory.source_message_ids,
+          metadata: memory.metadata as Record<string, unknown>,
+        };
+      });
 
       scenes.push({
-        scene_name: typeof s.scene_name === "string" ? s.scene_name : "未知情境",
-        message_ids: Array.isArray(s.message_ids) ? s.message_ids.map(String) : [],
-        memories: Array.isArray(s.memories)
-          ? (s.memories as Array<Record<string, unknown>>)
-              .filter((m) => m && typeof m === "object" && typeof m.content === "string" && (m.content as string).length > 0)
-              .map((m) => ({
-                content: String(m.content),
-                type: String(m.type ?? "episodic"),
-                priority: typeof m.priority === "number" ? m.priority : 50,
-                source_message_ids: Array.isArray(m.source_message_ids) ? m.source_message_ids.map(String) : [],
-                metadata: (m.metadata && typeof m.metadata === "object" ? m.metadata : {}) as Record<string, unknown>,
-              }))
-          : [],
+        scene_name: s.scene_name,
+        message_ids: s.message_ids,
+        memories,
       });
     }
 
     return scenes;
   } catch (err) {
     logger?.warn?.(`${TAG} Failed to parse extraction result: ${err instanceof Error ? err.message : String(err)}`);
-    return [];
+    throw err instanceof Error ? err : new Error(String(err));
   }
 }
 
@@ -441,25 +484,19 @@ async function applyDecisions(params: {
       target_ids: [],
     };
 
-    try {
-      const record = await writeMemory({
-        memory: memoryWithId,
-        decision,
-        baseDir,
-        sessionKey,
-        sessionId,
-        logger,
-        vectorStore,
-        embeddingService,
-      });
+    const record = await writeMemory({
+      memory: memoryWithId,
+      decision,
+      baseDir,
+      sessionKey,
+      sessionId,
+      logger,
+      vectorStore,
+      embeddingService,
+    });
 
-      if (record) {
-        storedRecords.push(record);
-      }
-    } catch (err) {
-      logger?.warn?.(
-        `${TAG} Write failed for memory "${memoryWithId.content.slice(0, 50)}...": ${err instanceof Error ? err.message : String(err)}`,
-      );
+    if (record) {
+      storedRecords.push(record);
     }
   }
 
@@ -481,28 +518,22 @@ async function storeAllDirectly(
   const storedRecords: MemoryRecord[] = [];
 
   for (const memoryWithId of memoriesWithIds) {
-    try {
-      const record = await writeMemory({
-        memory: memoryWithId,
-        decision: {
-          record_id: memoryWithId.record_id,
-          action: "store",
-          target_ids: [],
-        },
-        baseDir,
-        sessionKey,
-        sessionId,
-        logger,
-        vectorStore,
-        embeddingService,
-      });
-      if (record) {
-        storedRecords.push(record);
-      }
-    } catch (err) {
-      logger?.warn?.(
-        `${TAG} Write failed for memory "${memoryWithId.content.slice(0, 50)}...": ${err instanceof Error ? err.message : String(err)}`,
-      );
+    const record = await writeMemory({
+      memory: memoryWithId,
+      decision: {
+        record_id: memoryWithId.record_id,
+        action: "store",
+        target_ids: [],
+      },
+      baseDir,
+      sessionKey,
+      sessionId,
+      logger,
+      vectorStore,
+      embeddingService,
+    });
+    if (record) {
+      storedRecords.push(record);
     }
   }
 

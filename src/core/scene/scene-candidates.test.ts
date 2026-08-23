@@ -59,6 +59,182 @@ describe("SceneCandidatePool (v2: router-driven)", () => {
     expect(pool.list()[0]!.memories).toHaveLength(1);
   });
 
+  it("does not let a retried memory change its candidate or anchor", async () => {
+    const pool = await SceneCandidatePool.load(tmpDir);
+    pool.addMemory(
+      { id: "m_1", ts: "2026-08-01", head: "original", sessionKey: "s1", embedding: [1, 0] },
+      0.3,
+      new Date("2026-08-01T00:00:00Z"),
+    );
+    pool.addMemory(
+      { id: "m_1", ts: "2026-08-02", head: "retry", sessionKey: "s2", embedding: [0.8, 0.6] },
+      0.3,
+      new Date("2026-08-02T00:00:00Z"),
+    );
+
+    const candidate = pool.list()[0]!;
+    expect(pool.list()).toHaveLength(1);
+    expect(candidate.memories).toHaveLength(1);
+    expect(candidate.anchor).toEqual([1, 0]);
+    expect(candidate.session_keys).toEqual(["s1"]);
+    expect(candidate.last_seen_at).toBe("2026-08-01T00:00:00.000Z");
+  });
+
+  it("selects the highest-similarity candidate instead of the first match", async () => {
+    const pool = await SceneCandidatePool.load(tmpDir);
+    pool.addMemory(
+      { id: "m_a", ts: "2026-08-01", head: "aaaa", sessionKey: "s1", embedding: [0.8, 0.6] },
+      0.95,
+    );
+    pool.addMemory(
+      { id: "m_b", ts: "2026-08-01", head: "zzzz", sessionKey: "s2", embedding: [1, 0] },
+      0.95,
+    );
+    pool.addMemory(
+      { id: "m_best", ts: "2026-08-02", head: "new topic", sessionKey: "s3", embedding: [0.99, 0.1] },
+      0.5,
+    );
+
+    const containingBest = pool.list().find((candidate) =>
+      candidate.memories.some((memory) => memory.id === "m_best"),
+    );
+    expect(containingBest?.memories.map((memory) => memory.id)).toEqual(["m_b", "m_best"]);
+  });
+
+  it("keeps different embedding dimensions in separate candidates", async () => {
+    const pool = await SceneCandidatePool.load(tmpDir);
+    pool.addMemory(
+      { id: "old", ts: "2026-08-01", head: "alpha topic", sessionKey: "s1", embedding: [1, 0] },
+      0.3,
+    );
+    pool.addMemory(
+      { id: "new", ts: "2026-08-02", head: "zulu subject", sessionKey: "s2", embedding: [1, 0, 0] },
+      0.3,
+    );
+    expect(pool.list()).toHaveLength(2);
+  });
+
+  it("does not use scene-name fallback to merge orthogonal anchored candidates", async () => {
+    const pool = await SceneCandidatePool.load(tmpDir);
+    pool.addMemory(
+      {
+        id: "axis_a",
+        ts: "2026-08-01",
+        head: "shared topic first",
+        sceneName: "shared scene",
+        sessionKey: "s1",
+        embedding: [1, 0],
+      },
+      0.3,
+    );
+    pool.addMemory(
+      {
+        id: "axis_b",
+        ts: "2026-08-02",
+        head: "shared topic second",
+        sceneName: "shared scene",
+        sessionKey: "s2",
+        embedding: [0, 1],
+      },
+      0.3,
+    );
+    expect(pool.list()).toHaveLength(2);
+  });
+
+  it("weights the centroid by embedded memories only", async () => {
+    const pool = await SceneCandidatePool.load(tmpDir);
+    pool.addMemory(
+      { id: "text_1", ts: "2026-08-01", head: "shared text one", sceneName: "shared", sessionKey: "s1" },
+      0.3,
+    );
+    pool.addMemory(
+      { id: "text_2", ts: "2026-08-02", head: "shared text two", sceneName: "shared", sessionKey: "s2" },
+      0.3,
+    );
+    pool.addMemory(
+      {
+        id: "vec_1",
+        ts: "2026-08-03",
+        head: "shared vector one",
+        sceneName: "shared",
+        sessionKey: "s3",
+        embedding: [1, 0],
+      },
+      0,
+    );
+    pool.addMemory(
+      {
+        id: "vec_2",
+        ts: "2026-08-04",
+        head: "shared vector two",
+        sceneName: "shared",
+        sessionKey: "s4",
+        embedding: [0, 1],
+      },
+      0,
+    );
+
+    expect(pool.list()).toHaveLength(1);
+    expect(pool.list()[0]!.anchor).toEqual([0.5, 0.5]);
+    expect(pool.list()[0]!.anchor_count).toBe(2);
+  });
+
+  it("infers anchor_count when loading a legacy candidate file", async () => {
+    await fs.writeFile(
+      path.join(tmpDir, ".metadata", "scene_candidates.json"),
+      JSON.stringify([
+        {
+          id: "legacy",
+          anchor: [1, 0],
+          memories: [
+            { id: "m1", ts: "2026-08-01", head: "one", sessionKey: "s1" },
+            { id: "m2", ts: "2026-08-02", head: "two", sessionKey: "s2" },
+          ],
+          session_keys: ["s1", "s2"],
+          first_seen_at: "2026-08-01T00:00:00.000Z",
+          last_seen_at: "2026-08-02T00:00:00.000Z",
+        },
+      ]),
+      "utf-8",
+    );
+
+    const pool = await SceneCandidatePool.load(tmpDir);
+    expect(pool.list()[0]!.anchor_count).toBe(2);
+  });
+
+  it("groups similar memories without embeddings and reaches promotion threshold", async () => {
+    const pool = await SceneCandidatePool.load(tmpDir);
+    for (let i = 0; i < 5; i++) {
+      pool.addMemory(
+        {
+          id: `degraded_${i}`,
+          ts: `2026-08-0${i + 1}`,
+          head: `database incident detail ${i}`,
+          sceneName: "database incident response",
+          sessionKey: `s${i % 2}`,
+        },
+        0.55,
+      );
+    }
+
+    expect(pool.list()).toHaveLength(1);
+    expect(pool.findPromotable(5, 3)).toHaveLength(1);
+  });
+
+  it("uses content-head similarity when scene names and embeddings are absent", async () => {
+    const pool = await SceneCandidatePool.load(tmpDir);
+    pool.addMemory(
+      { id: "text_1", ts: "2026-08-01", head: "postgres backup recovery plan", sessionKey: "s1" },
+      0.55,
+    );
+    pool.addMemory(
+      { id: "text_2", ts: "2026-08-02", head: "postgres backup recovery drill", sessionKey: "s2" },
+      0.55,
+    );
+    expect(pool.list()).toHaveLength(1);
+    expect(pool.list()[0]!.memories.map((memory) => memory.id)).toEqual(["text_1", "text_2"]);
+  });
+
   it("persists across load/save and prunes expired candidates", async () => {
     const pool = await SceneCandidatePool.load(tmpDir);
     // Explicit clock: last_seen 2026-08-01 is >30d before the prune date below

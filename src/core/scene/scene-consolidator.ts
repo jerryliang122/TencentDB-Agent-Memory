@@ -32,7 +32,11 @@ import {
   type ScenePointer,
 } from "./scene-format.js";
 import { routeMemories, updateAnchor, type RoutableMemory } from "./scene-router.js";
-import { SceneCandidatePool, type SceneCandidate } from "./scene-candidates.js";
+import {
+  SceneCandidatePool,
+  candidateAnchorCount,
+  type SceneCandidate,
+} from "./scene-candidates.js";
 import { SceneSynthesizer } from "./scene-synthesizer.js";
 import { readSceneIndex, syncSceneIndex, writeSceneIndex, type SceneIndexEntry } from "./scene-index.js";
 
@@ -199,6 +203,7 @@ export class SceneConsolidator {
           ts: mem.ts,
           head: pointerHead(mem.content),
           sessionKey: mem.sessionKey ?? "",
+          sceneName: mem.sceneName,
           embedding: mem.embedding,
         },
         this.routingThreshold,
@@ -212,7 +217,9 @@ export class SceneConsolidator {
         result.promotedScenes++;
       }
     }
-    const pruned = pool.pruneExpired(this.candidateTtlDays);
+    const pruned = this.candidateTtlDays > 0
+      ? pool.pruneExpired(this.candidateTtlDays)
+      : [];
     if (unmatched.length > 0 || promotable.length > 0 || pruned.length > 0) {
       await pool.save();
     }
@@ -430,7 +437,7 @@ export class SceneConsolidator {
       );
       state.scenes[filename] = {
         anchor: candidate.anchor,
-        anchorCount: candidate.memories.length,
+        anchorCount: candidateAnchorCount(candidate),
         summaryRefreshedAt: nowIso,
         newSinceRefresh: 0,
         memoryIds: candidate.memories.map((m) => m.id),
