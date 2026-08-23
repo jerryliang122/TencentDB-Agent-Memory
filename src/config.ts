@@ -465,6 +465,41 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
   // --- Pipeline ---
   const pipelineGroup = obj(c, "pipeline");
 
+  // Keep pipeline timers within Node's signed 32-bit timeout range. Larger
+  // delays are coerced by Node to a near-immediate timer, which could trigger
+  // extraction unexpectedly or turn a recurring schedule into a tight loop.
+  const maxTimerSeconds = Math.floor(0x7fffffff / 1000);
+  const l1IdleTimeoutSeconds = numberInRange(
+    num(pipelineGroup, "l1IdleTimeoutSeconds"),
+    0,
+    maxTimerSeconds,
+    600,
+  );
+  const l2DelayAfterL1Seconds = numberInRange(
+    num(pipelineGroup, "l2DelayAfterL1Seconds"),
+    0,
+    maxTimerSeconds,
+    10,
+  );
+  const l2MinIntervalSeconds = numberInRange(
+    num(pipelineGroup, "l2MinIntervalSeconds"),
+    0,
+    maxTimerSeconds,
+    900,
+  );
+  const configuredL2MaxIntervalSeconds = numberInRange(
+    num(pipelineGroup, "l2MaxIntervalSeconds"),
+    1,
+    maxTimerSeconds,
+    3600,
+  );
+  // The max-interval path does not independently apply the min-interval
+  // floor, so enforce the documented relationship at the config boundary.
+  const l2MaxIntervalSeconds = Math.max(
+    configuredL2MaxIntervalSeconds,
+    l2MinIntervalSeconds,
+  );
+
   // --- Recall ---
   const recallGroup = obj(c, "recall");
 
@@ -478,6 +513,10 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
   const embeddingProviderRaw = str(embeddingGroup, "provider") ?? "none";
   const embeddingModelRaw = str(embeddingGroup, "model") ?? "";
   const embeddingDimensionsRaw = num(embeddingGroup, "dimensions");
+  const embeddingDimensionsValid =
+    embeddingDimensionsRaw != null &&
+    Number.isInteger(embeddingDimensionsRaw) &&
+    embeddingDimensionsRaw > 0;
   const embeddingProxyUrl = str(embeddingGroup, "proxyUrl");
 
   // provider="none" → embedding disabled (default for zero-config users)
@@ -506,7 +545,7 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
     if (!embeddingBaseUrl) missingFields.push("baseUrl");
     if (!embeddingApiKey) missingFields.push("apiKey");
     if (!embeddingModelRaw) missingFields.push("model");
-    if (embeddingDimensionsRaw == null || embeddingDimensionsRaw <= 0) missingFields.push("dimensions");
+    if (!embeddingDimensionsValid) missingFields.push("dimensions (must be a positive integer)");
 
     if (missingFields.length > 0) {
       const errorMsg =
@@ -524,7 +563,7 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
     if (!embeddingApiKey) missingFields.push("apiKey");
     if (!embeddingBaseUrl) missingFields.push("baseUrl");
     if (!embeddingModelRaw) missingFields.push("model");
-    if (embeddingDimensionsRaw == null || embeddingDimensionsRaw <= 0) missingFields.push("dimensions");
+    if (!embeddingDimensionsValid) missingFields.push("dimensions (must be a positive integer)");
 
     if (missingFields.length > 0) {
       // Configuration error: disable embedding and log detailed error
@@ -541,13 +580,33 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
     }
   }
 
+  // `provider="none"` legitimately omits dimensions, but an explicitly
+  // supplied invalid value should still be reported. More importantly, never
+  // pass a positive non-integer through to sqlite-vec's `float[N]` schema.
+  const isDisabledEmbeddingSentinel =
+    embeddingProviderRaw === "none" && embeddingDimensionsRaw === 0;
+  if (
+    "dimensions" in embeddingGroup &&
+    !embeddingDimensionsValid &&
+    !isDisabledEmbeddingSentinel
+  ) {
+    embeddingEnabled = false;
+    if (!embeddingConfigError?.includes("positive integer")) {
+      const dimensionsError =
+        "Embedding 'dimensions' must be a positive integer. Embedding has been disabled.";
+      embeddingConfigError = embeddingConfigError
+        ? `${embeddingConfigError} ${dimensionsError}`
+        : dimensionsError;
+    }
+  }
+
   // When provider="none", dimensions=0 signals VectorStore to skip vec0 table
   // creation entirely (deferred until a real embedding provider is configured).
   // This avoids creating vec0 tables with a placeholder dimension that would
   // mismatch if the user later enables a different-dimensional provider.
   const defaultDimensions =
-    embeddingProvider === "none" ? 0 :
-    embeddingDimensionsRaw ?? 0;
+    embeddingProvider === "none" || !embeddingDimensionsValid ? 0 :
+    embeddingDimensionsRaw!;
   const defaultModel = embeddingProvider === "none" ? "" : embeddingModelRaw;
 
   const cleanTime = normalizeCleanTime(str(captureGroup, "cleanTime")) ?? "03:00";
@@ -604,7 +663,10 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
     extraction: {
       enabled: bool(extractionGroup, "enabled") ?? true,
       enableDedup: bool(extractionGroup, "enableDedup") ?? true,
-      maxMemoriesPerSession: num(extractionGroup, "maxMemoriesPerSession") ?? 20,
+      maxMemoriesPerSession: positiveInteger(
+        num(extractionGroup, "maxMemoriesPerSession"),
+        20,
+      ),
       model: optStr(extractionGroup, "model"),
     },
     persona: {
@@ -619,7 +681,10 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       sceneTtlDays: num(personaGroup, "sceneTtlDays") ?? 30,
       sceneCreateThresholdMemories: num(personaGroup, "sceneCreateThresholdMemories") ?? 5,
       sceneCreateThresholdSessions: num(personaGroup, "sceneCreateThresholdSessions") ?? 3,
-      sceneCandidateTtlDays: num(personaGroup, "sceneCandidateTtlDays") ?? 30,
+      sceneCandidateTtlDays: nonNegativeNumber(
+        num(personaGroup, "sceneCandidateTtlDays"),
+        30,
+      ),
       sceneInjectTopK: num(personaGroup, "sceneInjectTopK") ?? num(personaGroup, "l3InjectTopK") ?? 5,
       sceneInjectSummaryChars: num(personaGroup, "sceneInjectSummaryChars") ?? num(personaGroup, "l3InjectSummaryChars") ?? 150,
       sceneRoutingThreshold: num(personaGroup, "sceneRoutingThreshold") ?? 0.55,
@@ -630,15 +695,15 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
     pipeline: {
       everyNConversations: num(pipelineGroup, "everyNConversations") ?? 5,
       enableWarmup: bool(pipelineGroup, "enableWarmup") ?? true,
-      l1IdleTimeoutSeconds: num(pipelineGroup, "l1IdleTimeoutSeconds") ?? 600,
-      l2DelayAfterL1Seconds: num(pipelineGroup, "l2DelayAfterL1Seconds") ?? 10,
-      l2MinIntervalSeconds: num(pipelineGroup, "l2MinIntervalSeconds") ?? 900,
-      l2MaxIntervalSeconds: num(pipelineGroup, "l2MaxIntervalSeconds") ?? 3600,
+      l1IdleTimeoutSeconds,
+      l2DelayAfterL1Seconds,
+      l2MinIntervalSeconds,
+      l2MaxIntervalSeconds,
       sessionActiveWindowHours: num(pipelineGroup, "sessionActiveWindowHours") ?? 24,
     },
     recall: {
       enabled: bool(recallGroup, "enabled") ?? true,
-      maxResults: num(recallGroup, "maxResults") ?? 5,
+      maxResults: positiveInteger(num(recallGroup, "maxResults"), 5, 500),
       maxCharsPerMemory: num(recallGroup, "maxCharsPerMemory") ?? 0,
       maxTotalRecallChars: num(recallGroup, "maxTotalRecallChars") ?? 0,
       scoreThreshold: num(recallGroup, "scoreThreshold") ?? 0.55,
@@ -656,9 +721,12 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       baseUrl: embeddingBaseUrl,
       apiKey: embeddingApiKey,
       model: str(embeddingGroup, "model") ?? defaultModel,
-      dimensions: num(embeddingGroup, "dimensions") ?? defaultDimensions,
+      dimensions: defaultDimensions,
       sendDimensions: bool(embeddingGroup, "sendDimensions") ?? true,
-      conflictRecallTopK: num(embeddingGroup, "conflictRecallTopK") ?? 5,
+      conflictRecallTopK: positiveInteger(
+        num(embeddingGroup, "conflictRecallTopK"),
+        5,
+      ),
       proxyUrl: embeddingProxyUrl,
       maxInputChars: num(embeddingGroup, "maxInputChars") ?? 5000,
       timeoutMs: num(embeddingGroup, "timeoutMs") ?? 10_000,
@@ -715,6 +783,27 @@ function optStr(src: Record<string, unknown>, key: string): string | undefined {
 function num(src: Record<string, unknown>, key: string): number | undefined {
   const v = src[key];
   return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
+/** Resolve a positive integer, optionally clamping it to a defensive cap. */
+function positiveInteger(value: number | undefined, fallback: number, max = Infinity): number {
+  if (value == null || !Number.isInteger(value) || value <= 0) return fallback;
+  return Math.min(value, max);
+}
+
+/** Resolve a non-negative finite number (zero can be a documented off switch). */
+function nonNegativeNumber(value: number | undefined, fallback: number): number {
+  return value != null && value >= 0 ? value : fallback;
+}
+
+/** Resolve a finite number inside an inclusive range. */
+function numberInRange(
+  value: number | undefined,
+  min: number,
+  max: number,
+  fallback: number,
+): number {
+  return value != null && value >= min && value <= max ? value : fallback;
 }
 
 function bool(src: Record<string, unknown>, key: string): boolean | undefined {

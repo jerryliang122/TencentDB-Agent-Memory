@@ -34,7 +34,7 @@
         "properties": {
           "enabled": { "type": "boolean", "default": true, "description": "是否启用后台提取" },
           "enableDedup": { "type": "boolean", "default": true, "description": "L1 智能去重（基于向量相似度或关键词进行冲突检测）" },
-          "maxMemoriesPerSession": { "type": "number", "default": 20, "description": "单次 L1 提取每 session 最大记忆条数" },
+          "maxMemoriesPerSession": { "type": "integer", "minimum": 1, "default": 20, "description": "单次 L1 提取每 session 最大记忆条数" },
           "model": { "type": "string", "description": "提取使用模型 (格式: provider/model)，未填写时使用openclaw默认模型" }
         }
       },
@@ -51,7 +51,7 @@
           "sceneTtlDays": { "type": "number", "default": 30, "description": "L2 场景块 TTL（天），0=不清理" },
           "sceneCreateThresholdMemories": { "type": "number", "default": 5, "description": "候选池提升阈值：累积 L1 记忆数" },
           "sceneCreateThresholdSessions": { "type": "number", "default": 3, "description": "候选池提升阈值：跨独立 session 数" },
-          "sceneCandidateTtlDays": { "type": "number", "default": 30, "description": "候选池老化周期（天）" },
+          "sceneCandidateTtlDays": { "type": "number", "minimum": 0, "default": 30, "description": "候选池老化周期（天），0=不清理" },
           "sceneInjectTopK": { "type": "number", "default": 5, "description": "@deprecated v2 L2 注入全部 TTL 内活跃场景，不再截取 top-K" },
           "sceneInjectSummaryChars": { "type": "number", "default": 150, "description": "@deprecated v2 L2 摘要上限改由 sceneSummaryMaxChars 控制" },
           "sceneRoutingThreshold": { "type": "number", "default": 0.55, "description": "路由阈值:记忆向量与场景锚点余弦相似度达到该值才归入该场景(BGE-M3 平衡档;未匹配的记忆安全落入候选池)" },
@@ -66,10 +66,10 @@
         "properties": {
           "everyNConversations": { "type": "number", "default": 5, "description": "每 N 轮对话触发 L1 批处理" },
           "enableWarmup": { "type": "boolean", "default": true, "description": "Warm-up 模式：新 session 从 1 轮触发开始，每次 L1 后翻倍（1→2→4→...→everyN），加速早期记忆提取" },
-          "l1IdleTimeoutSeconds": { "type": "number", "default": 600, "description": "L1 空闲超时（秒）：用户停止对话后多久触发 L1 批处理" },
-          "l2DelayAfterL1Seconds": { "type": "number", "default": 10, "description": "L1 完成后延迟多久触发 L2（秒）" },
-          "l2MinIntervalSeconds": { "type": "number", "default": 900, "description": "同一 session 两次 L2 抽取的最小间隔（秒）" },
-          "l2MaxIntervalSeconds": { "type": "number", "default": 3600, "description": "同一活跃 session 的 L2 最大轮询间隔（秒）" },
+          "l1IdleTimeoutSeconds": { "type": "number", "minimum": 0, "maximum": 2147483, "default": 600, "description": "L1 空闲超时（秒）：用户停止对话后多久触发 L1 批处理" },
+          "l2DelayAfterL1Seconds": { "type": "number", "minimum": 0, "maximum": 2147483, "default": 10, "description": "L1 完成后延迟多久触发 L2（秒）" },
+          "l2MinIntervalSeconds": { "type": "number", "minimum": 0, "maximum": 2147483, "default": 900, "description": "同一 session 两次 L2 抽取的最小间隔（秒）" },
+          "l2MaxIntervalSeconds": { "type": "number", "minimum": 1, "maximum": 2147483, "default": 3600, "description": "同一活跃 session 的 L2 最大轮询间隔（秒）" },
           "sessionActiveWindowHours": { "type": "number", "default": 24, "description": "session 活跃窗口（小时），超过此时间不活跃的 session 停止 L2 轮询" }
         }
       },
@@ -78,7 +78,7 @@
         "description": "记忆召回设置",
         "properties": {
           "enabled": { "type": "boolean", "default": true, "description": "是否启用自动召回" },
-          "maxResults": { "type": "number", "default": 5, "description": "召回最大结果数" },
+          "maxResults": { "type": "integer", "minimum": 1, "maximum": 500, "default": 5, "description": "召回最大结果数" },
           "maxCharsPerMemory": { "type": "number", "default": 0, "description": "单条 L1 记忆注入的最大字符数；填 0 表示不限制" },
           "maxTotalRecallChars": { "type": "number", "default": 0, "description": "本轮 auto-recall 注入的 L1 记忆总字符预算；填 0 表示不限制" },
           "scoreThreshold": { "type": "number", "default": 0.55, "description": "向量召回余弦相似度阈值(BGE-M3 校准:0.4-0.5 宽召回 / 0.5-0.6 平衡 / 0.6-0.7 精确;中文短文本建议 ≤0.6)" },
@@ -101,9 +101,9 @@
           "baseUrl": { "type": "string", "description": "API Base URL（必填）：填写对应 provider 的 API 地址" },
           "apiKey": { "type": "string", "description": "API Key（必填）" },
           "model": { "type": "string", "description": "模型名称（必填）" },
-          "dimensions": { "type": "number", "description": "向量维度（必填，需与所选模型匹配）" },
+          "dimensions": { "type": "integer", "minimum": 0, "description": "向量维度（远程 provider 必须为正整数；provider=none 时可设 0）" },
           "sendDimensions": { "type": "boolean", "default": true, "description": "是否在请求体中携带 dimensions 字段。默认 true（兼容 OpenAI text-embedding-3-* 的 Matryoshka 截断）。当目标服务为 BGE-M3 等不支持自定义维度的固定维度模型时，请设为 false，否则会被服务端以 HTTP 400 拒绝（'does not support matryoshka representation'）。" },
-          "conflictRecallTopK": { "type": "number", "default": 5, "description": "冲突检测时召回 Top-K 数" },
+          "conflictRecallTopK": { "type": "integer", "minimum": 1, "default": 5, "description": "冲突检测时召回 Top-K 数" },
           "maxInputChars": { "type": "number", "default": 5000, "description": "Embedding 输入文本最大字符数，超出时截断并打印警告日志（默认 5000，适合大多数模型的 token 上限）" },
           "timeoutMs": { "type": "number", "default": 10000, "description": "单次 embedding API 调用超时（毫秒），超时后会自动重试（最多 3 次）" },
           "recallTimeoutMs": { "type": "number", "description": "recall 路径 embedding 超时（毫秒），覆盖 timeoutMs。用户等待中，建议设短一些（如 3000）" },

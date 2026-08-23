@@ -286,9 +286,12 @@ export function pickRecentUnique(texts: string[], max: number): string[] {
  * the XML section.
  */
 export function escapeXmlTags(text: string): string {
-  // Escape closing tags that match our injection section boundaries
+  // Escape prompt/context boundary tags, including whitespace and attributes
+  // accepted by XML-like parsers. Ampersands are intentionally left alone:
+  // already-escaped input stays unchanged, so this helper is idempotent and
+  // callers can safely apply it at more than one trust boundary.
   return text.replace(
-    /<\/?(?:user-persona|relevant-memories|scene-navigation|relevant-scenes|memory-tools-guide|system|assistant)>/gi,
+    /<\s*\/?\s*(?:user-persona|relevant-memories|active-scenes|scene-navigation|relevant-scenes|memory-tools-guide|current_task_context|history_task_context|l4_skill_result|system|assistant|developer|tool|function)(?=[\s/>])[^>]*>/gi,
     (match) => match.replace(/</g, "&lt;").replace(/>/g, "&gt;"),
   );
 }

@@ -17,6 +17,10 @@ describe("cosineSimilarity", () => {
   it("returns 0 for zero vectors (undefined cosine)", () => {
     expect(cosineSimilarity([0, 0], [1, 1])).toBe(0);
   });
+
+  it("returns 0 when vector dimensions differ", () => {
+    expect(cosineSimilarity([1, 0], [1, 0, 100])).toBe(0);
+  });
 });
 
 describe("routeMemories", () => {
@@ -70,6 +74,19 @@ describe("routeMemories", () => {
     const { unmatched } = routeMemories([mem("a", [1, 0])], onlyAnchorless, 0.3);
     expect(unmatched).toHaveLength(1);
   });
+
+  it("does not route by a matching vector prefix when dimensions differ", () => {
+    const mismatched: RouteTarget[] = [
+      { filename: "legacy.md", title: "unrelated legacy topic", anchor: [1, 0] },
+    ];
+    const { assignments, unmatched } = routeMemories(
+      [mem("new-model", [1, 0, 0], "fresh scene", "fresh content")],
+      mismatched,
+      0.3,
+    );
+    expect(assignments.size).toBe(0);
+    expect(unmatched.map((item) => item.id)).toEqual(["new-model"]);
+  });
 });
 
 describe("updateAnchor", () => {
@@ -88,6 +105,12 @@ describe("updateAnchor", () => {
     const res = updateAnchor([1, 1], 1, []);
     expect(res.anchor).toEqual([1, 1]);
     expect(res.count).toBe(1);
+  });
+
+  it("ignores vectors whose dimensions do not match the anchor", () => {
+    const res = updateAnchor([2, 0], 2, [[1, 0, 0]]);
+    expect(res.anchor).toEqual([2, 0]);
+    expect(res.count).toBe(2);
   });
 });
 

@@ -13,6 +13,7 @@
  */
 
 import path from "node:path";
+import { escapeXmlTags } from "../../utils/sanitize.js";
 import type { SceneIndexEntry } from "./scene-index.js";
 
 const NAV_HEADER = "---\n## 🗺️ Scene Navigation (Scene Index)";
@@ -73,11 +74,15 @@ export function generateActiveScenes(
 
   const lines = active.map((e) => {
     const range = formatRange(e.first_active, e.last_active);
-    const parts = [e.summary, e.memory_count > 0 ? `记忆: ${e.memory_count}条` : ""].filter(Boolean);
+    // Scene index fields ultimately originate from persisted/LLM-generated
+    // content and are untrusted at the system <active-scenes> boundary.
+    const title = escapeXmlTags(e.title);
+    const summary = escapeXmlTags(e.summary);
+    const parts = [summary, e.memory_count > 0 ? `记忆: ${e.memory_count}条` : ""].filter(Boolean);
     const detail = parts.join(" | ");
     return detail
-      ? `- ${e.title} (${range})\n  ${detail}`
-      : `- ${e.title} (${range})`;
+      ? `- ${title} (${range})\n  ${detail}`
+      : `- ${title} (${range})`;
   });
   return lines.join("\n");
 }

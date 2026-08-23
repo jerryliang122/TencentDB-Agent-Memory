@@ -289,7 +289,9 @@ export async function recordConversation(params: {
     logger?.debug?.(`${TAG} Recorded ${filtered.length} messages to ${outPath}`);
   } catch (err) {
     logger?.error(`${TAG} Failed to write L0 file: ${err instanceof Error ? err.message : String(err)}`);
-    // Return filtered messages anyway so L1 can still process them
+    // The caller advances its capture checkpoint only after this function resolves.
+    // Propagate persistence failures so the same messages are retried instead of lost.
+    throw err;
   }
 
   return filtered;
@@ -306,6 +308,7 @@ export async function readConversationRecords(
   sessionKey: string,
   baseDir: string,
   logger?: Logger,
+  strict = false,
 ): Promise<L0ConversationRecord[]> {
   const conversationsDir = path.join(baseDir, "conversations");
 
@@ -318,8 +321,13 @@ export async function readConversationRecords(
     entries = dirEntries
       .filter((entry) => entry.isFile())
       .map((entry) => entry.name);
-  } catch {
-    // Directory doesn't exist yet — normal for first conversation
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      // Directory doesn't exist yet — normal for first conversation.
+      return [];
+    }
+    if (strict) throw err;
+    logger?.warn?.(`${TAG} Failed to list L0 directory: ${conversationsDir}`);
     return [];
   }
 
@@ -339,7 +347,8 @@ export async function readConversationRecords(
     let raw: string;
     try {
       raw = await fs.readFile(filePath, "utf-8");
-    } catch {
+    } catch (err) {
+      if (strict) throw err;
       logger?.warn?.(`${TAG} Failed to read L0 file: ${filePath}`);
       continue;
     }
@@ -357,23 +366,44 @@ export async function readConversationRecords(
         if (typeof parsed.role === "string" && typeof parsed.content === "string") {
           // Flat format: { sessionKey, sessionId, recordedAt, id, role, content, timestamp }
           // Wrap into L0ConversationRecord for uniform downstream consumption
+          const parsedTimestamp = typeof parsed.timestamp === "number" && Number.isFinite(parsed.timestamp)
+            ? parsed.timestamp
+            : undefined;
+          const parsedRecordedAt = typeof parsed.recordedAt === "string" && Number.isFinite(Date.parse(parsed.recordedAt))
+            ? parsed.recordedAt
+            : undefined;
+          // Legacy rows may lack all generated fields. Derive them solely from
+          // persisted input so repeated reads and cursor retries remain stable.
+          const fileDateMs = Date.parse(`${fileName.slice(0, 10)}T00:00:00.000Z`);
+          const stableFallbackMs = fileDateMs + i;
+          const stableTimestamp = parsedTimestamp ?? stableFallbackMs;
+          const stableRecordedAt = parsedRecordedAt ?? new Date(stableTimestamp).toISOString();
+          const stableLegacyId = `msg_legacy_${crypto.createHash("sha256")
+            .update(`${fileName}:${i}`)
+            .digest("hex")
+            .slice(0, 16)}`;
           const msg: ConversationMessage = {
-            id: (typeof parsed.id === "string" && parsed.id) ? parsed.id : generateMessageId(),
+            id: (typeof parsed.id === "string" && parsed.id) ? parsed.id : stableLegacyId,
             role: parsed.role as "user" | "assistant",
             content: parsed.content as string,
-            timestamp: typeof parsed.timestamp === "number" ? parsed.timestamp : Date.now(),
+            timestamp: stableTimestamp,
           };
           records.push({
             sessionKey: (parsed.sessionKey as string) || sessionKey,
             sessionId: (parsed.sessionId as string) || "",
-            recordedAt: (parsed.recordedAt as string) || new Date().toISOString(),
+            recordedAt: stableRecordedAt,
             messageCount: 1,
             messages: [msg],
           });
         } else {
-          logger?.warn?.(`${TAG} Unrecognized JSONL line format in ${filePath}:${i + 1}`);
+          const message = `${TAG} Unrecognized JSONL line format in ${filePath}:${i + 1}`;
+          if (strict) throw new Error(message);
+          logger?.warn?.(message);
         }
-      } catch {
+      } catch (err) {
+        if (strict) {
+          throw new Error(`${TAG} Malformed JSONL line in ${filePath}:${i + 1}`, { cause: err });
+        }
         logger?.warn?.(`${TAG} Skipping malformed JSONL line in ${filePath}:${i + 1}`);
       }
     }
@@ -395,7 +425,7 @@ export async function readConversationRecords(
  * optionally filtered by a cursor timestamp (messages after the cursor).
  *
  * When `limit` is provided, only the **newest** `limit` messages are returned
- * (matching the DB path's `ORDER BY timestamp DESC LIMIT ?` behavior).
+ * (matching the historical public helper contract).
  * Returned messages are always in chronological order (oldest → newest).
  *
  * NOTE: potential optimization — records are chronologically ordered (append-only JSONL),
@@ -445,9 +475,11 @@ export interface SessionIdMessageGroup {
  * instances (e.g. after /reset). L1 extraction should process each group independently
  * so that each group's sessionId is correctly associated with its extracted memories.
  *
- * When `limit` is provided, only the **newest** `limit` messages (across all groups)
- * are retained — matching the DB path's `ORDER BY recorded_at DESC LIMIT ?` behavior.
- * Groups that become empty after truncation are dropped.
+ * When `limit` is provided, the **oldest** page (across all groups) is retained
+ * so repeated cursor reads drain a backlog instead of skipping it. All messages
+ * sharing the boundary `recordedAt` are included, even if that makes the page
+ * larger than `limit`, because the timestamp-only cursor cannot split that cohort.
+ * Groups that become empty after pagination are dropped.
  *
  * Groups are returned in chronological order (by earliest message timestamp).
  * Messages within each group are also in chronological order.
@@ -461,7 +493,9 @@ export async function readConversationMessagesGroupedBySessionId(
   logger?: Logger,
   limit?: number,
 ): Promise<SessionIdMessageGroup[]> {
-  const records = await readConversationRecords(sessionKey, baseDir, logger);
+  // L1 pagination is fail-closed: skipping an unreadable older row and then
+  // advancing past a newer row would make the older data permanently unreachable.
+  const records = await readConversationRecords(sessionKey, baseDir, logger, true);
 
   // Collect all messages with their sessionId, filtering by recorded_at cursor
   const allMessages: Array<{ sessionId: string; msg: ConversationMessage & { recordedAtMs: number } }> = [];
@@ -475,17 +509,30 @@ export async function readConversationMessagesGroupedBySessionId(
     }
   }
 
-  // Sort by timestamp ASC (chronological) — records are already roughly ordered
-  // by recordedAt, but messages within may not be perfectly sorted by timestamp.
-  allMessages.sort((a, b) => a.msg.timestamp - b.msg.timestamp);
+  // The L1 cursor is based on recordedAt, so page in that order. Conversation
+  // timestamps are only a deterministic secondary key within one write cohort.
+  allMessages.sort((a, b) =>
+    a.msg.recordedAtMs - b.msg.recordedAtMs ||
+    a.msg.timestamp - b.msg.timestamp ||
+    a.msg.id.localeCompare(b.msg.id),
+  );
 
-  // Truncate to newest `limit` messages (keep tail)
+  // Take the oldest page and keep the boundary recordedAt cohort intact.
   let selected = allMessages;
   if (limit != null && limit > 0 && allMessages.length > limit) {
+    const boundaryRecordedAtMs = allMessages[limit - 1].msg.recordedAtMs;
+    let end = limit;
+    while (
+      end < allMessages.length &&
+      allMessages[end].msg.recordedAtMs === boundaryRecordedAtMs
+    ) {
+      end++;
+    }
     logger?.debug?.(
-      `${TAG} readConversationMessagesGroupedBySessionId: truncating ${allMessages.length} → ${limit} (newest)`,
+      `${TAG} readConversationMessagesGroupedBySessionId: selecting oldest ${end}/${allMessages.length} ` +
+      `(limit=${limit}, boundary cohort preserved)`,
     );
-    selected = allMessages.slice(-limit);
+    selected = allMessages.slice(0, end);
   }
 
   // Re-group by sessionId
@@ -499,14 +546,18 @@ export async function readConversationMessagesGroupedBySessionId(
     group.push(msg);
   }
 
-  // Convert to array, sorted by earliest message timestamp in each group
+  // Convert to array, sorted by earliest write timestamp in each group.
   const groups: SessionIdMessageGroup[] = [];
   for (const [sessionId, messages] of groupMap) {
     if (messages.length > 0) {
       groups.push({ sessionId, messages });
     }
   }
-  groups.sort((a, b) => a.messages[0].timestamp - b.messages[0].timestamp);
+  groups.sort((a, b) =>
+    a.messages[0].recordedAtMs - b.messages[0].recordedAtMs ||
+    a.messages[0].timestamp - b.messages[0].timestamp ||
+    a.sessionId.localeCompare(b.sessionId),
+  );
 
   return groups;
 }

@@ -55,8 +55,8 @@ export function cosineSimilarity(
   a: ArrayLike<number>,
   b: ArrayLike<number>,
 ): number {
-  const n = Math.min(a.length, b.length);
-  if (n === 0) return 0;
+  if (a.length === 0 || a.length !== b.length) return 0;
+  const n = a.length;
   let dot = 0;
   let normA = 0;
   let normB = 0;
@@ -125,17 +125,18 @@ export function updateAnchor(
   const usable = vectors.filter((v) => v && v.length > 0);
   if (usable.length === 0) return { anchor: anchor ?? null, count };
 
-  const dims = Math.max(anchor?.length ?? 0, ...usable.map((v) => v.length));
-  if (dims === 0) return { anchor: anchor ?? null, count };
+  const dims = anchor?.length ?? usable[0]!.length;
+  const compatible = usable.filter((v) => v.length === dims);
+  if (compatible.length === 0) return { anchor: anchor ?? null, count };
 
   const sum = new Array<number>(dims).fill(0);
   if (anchor) {
     for (let i = 0; i < anchor.length; i++) sum[i]! += anchor[i]! * count;
   }
-  for (const v of usable) {
+  for (const v of compatible) {
     for (let i = 0; i < v.length; i++) sum[i]! += v[i]!;
   }
-  const newCount = count + usable.length;
+  const newCount = count + compatible.length;
   return { anchor: sum.map((s) => s / newCount), count: newCount };
 }
 
