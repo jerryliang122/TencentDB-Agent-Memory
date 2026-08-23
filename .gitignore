@@ -44,3 +44,6 @@ test-offload-sessions.sh
 
 # log files
 *.log
+# 生产数据副本,禁止入库(含真实凭证与对话内容)
+memory-tdai/
+.zcode/

@@ -401,3 +401,60 @@ describe("performAutoRecall - scoreThreshold filter (embedding-only regression)"
     expect(result).toBeUndefined();
   });
 });
+
+describe("performAutoRecall - FTS/cosine threshold decoupling (BGE-M3 calibration)", () => {
+  it("a tight cosine threshold does not over-filter the FTS path", async () => {
+    // scoreThreshold 0.65 (precise cosine band) kills the 0.5 embedding hit,
+    // but the FTS hit at 0.4 passes via the default ftsScoreThreshold 0.35 —
+    // the two scales are independent.
+    const store = makeStore({
+      vecResults: [makeL1Hit({ record_id: "m_vec", content: "vec hit", score: 0.5 })],
+      ftsResults: [makeFtsHit({ record_id: "m_fts", content: "fts hit", score: 0.4 })],
+      ftsAvailable: true,
+    });
+    const result = await performAutoRecall({
+      userText: "请帮我查询项目进度",
+      actorId: "test",
+      sessionKey: "sess-1",
+      cfg: makeCfg({ strategy: "hybrid", scoreThreshold: 0.65 }),
+      pluginDataDir: "/nonexistent",
+      vectorStore: store,
+      embeddingService: makeEmbedder(),
+    });
+    expect(result?.prependContext).toBeDefined();
+    expect(result!.prependContext!).toContain("m_fts");
+    expect(result!.prependContext!).not.toContain("m_vec");
+  });
+
+  it("ftsScoreThreshold can be tightened independently of scoreThreshold", async () => {
+    // 6 FTS hits (> maxResults) → strict path, no small-docset escape hatch.
+    // All scores 0.4 < tightened ftsScoreThreshold 0.45 → filtered out,
+    // even though scoreThreshold (cosine, unused on keyword path) is 0.5.
+    const store = makeStore({
+      ftsResults: Array.from({ length: 6 }, (_, i) =>
+        makeFtsHit({ record_id: `m_f${i}`, score: 0.4 }),
+      ),
+      ftsAvailable: true,
+    });
+    const result = await performAutoRecall({
+      userText: "请帮我查询项目进度",
+      actorId: "test",
+      sessionKey: "sess-1",
+      cfg: makeCfg({ strategy: "keyword", scoreThreshold: 0.5, ftsScoreThreshold: 0.45 }),
+      pluginDataDir: "/nonexistent",
+      vectorStore: store,
+      embeddingService: makeEmbedder(),
+    });
+    expect(result).toBeUndefined();
+  });
+});
+
+describe("parseConfig BGE-M3 calibrated defaults", () => {
+  it("defaults to empirically calibrated thresholds", async () => {
+    const { parseConfig } = await import("../../config.js");
+    const cfg = parseConfig(undefined);
+    expect(cfg.recall.scoreThreshold).toBe(0.55);
+    expect(cfg.recall.ftsScoreThreshold).toBe(0.35);
+    expect(cfg.persona.sceneRoutingThreshold).toBe(0.55);
+  });
+});

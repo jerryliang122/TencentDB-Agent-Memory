@@ -1310,17 +1310,19 @@ export function registerOffload(api: any, offloadConfig: OffloadConfig): void {
 // ─── OffloadContextEngine ────────────────────────────────────────────────────
 
 class OffloadContextEngine {
-  private _sessions: SessionRegistry;
-  private _logger: PluginLogger;
-  private _pCfg: Partial<PluginConfig>;
-  private _getContextWindow: () => number;
-  private _notifyL2NewNullEntries: (count: number) => void;
-  private _clearL2Timeout: () => void;
-  private _l4State: { pendingResult: any };
-  private _flushL1: (mgr: OffloadStateManager, triggerSource: string, fireAndForget?: boolean, maxCount?: number) => Promise<void>;
-  private _backendClient: BackendClient | null;
-  private _judgeL15: (mgr: OffloadStateManager, event: any, ctx: any) => Promise<void>;
-  private _disposeL15: () => void;
+  // Definite-assignment: all fields are set by update(), invoked from the
+  // constructor and on every registerOffload() hot-update.
+  private _sessions!: SessionRegistry;
+  private _logger!: PluginLogger;
+  private _pCfg!: Partial<PluginConfig>;
+  private _getContextWindow!: () => number;
+  private _notifyL2NewNullEntries!: (count: number) => void;
+  private _clearL2Timeout!: () => void;
+  private _l4State!: { pendingResult: any };
+  private _flushL1!: (mgr: OffloadStateManager, triggerSource: string, fireAndForget?: boolean, maxCount?: number) => Promise<void>;
+  private _backendClient!: BackendClient | null;
+  private _judgeL15!: (mgr: OffloadStateManager, event: any, ctx: any) => Promise<void>;
+  private _disposeL15!: () => void;
 
   constructor(opts: any) {
     this.update(opts);
@@ -2163,39 +2165,17 @@ class OffloadContextEngine {
       return { ok: false, compacted: false, reason: "no_session_manager" };
     }
     try {
-      // Try delegating to runtime's built-in compaction first
+      // Try delegating to runtime's built-in compaction first.
+      // `delegateCompactionToRuntime` is a public SDK export; the bare
+      // `openclaw/plugin-sdk` subpath does not exist — the canonical module is
+      // `openclaw/plugin-sdk/core` (resolved against the host process).
       let delegateFn: any;
       try {
-        const { createRequire } = await import("node:module");
-        const globalRequire = createRequire("/usr/local/lib/node_modules/openclaw/");
-        const sdk = globalRequire("openclaw/plugin-sdk");
+        const sdk: { delegateCompactionToRuntime?: unknown } = await import("openclaw/plugin-sdk/core");
         delegateFn = sdk.delegateCompactionToRuntime;
-        logger.debug?.(`[context-offload] compact: resolved via createRequire (global path)`);
+        logger.debug?.(`[context-offload] compact: resolved via openclaw/plugin-sdk/core`);
       } catch (e1) {
-        logger.debug?.(`[context-offload] compact: createRequire failed: ${e1}`);
-        try {
-          const paths = [
-            "/usr/local/lib/node_modules/openclaw/dist/plugin-sdk/index.js",
-            "/usr/lib/node_modules/openclaw/dist/plugin-sdk/index.js",
-          ];
-          for (const p of paths) {
-            try {
-              const sdk = await import(p);
-              delegateFn = sdk.delegateCompactionToRuntime;
-              logger.debug?.(`[context-offload] compact: resolved via absolute path: ${p}`);
-              break;
-            } catch (ep) {
-              logger.debug?.(`[context-offload] compact: absolute path failed: ${p} → ${ep}`);
-            }
-          }
-        } catch { /* ignore */ }
-        if (!delegateFn) {
-          try {
-            const sdk = await import("openclaw/plugin-sdk" as any);
-            delegateFn = sdk.delegateCompactionToRuntime;
-            logger.debug?.(`[context-offload] compact: resolved via direct import`);
-          } catch { /* ignore */ }
-        }
+        logger.debug?.(`[context-offload] compact: openclaw/plugin-sdk/core import failed: ${e1}`);
       }
 
       if (typeof delegateFn === "function") {

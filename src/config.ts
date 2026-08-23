@@ -45,7 +45,7 @@ export interface ExtractionConfig {
   model?: string;
 }
 
-/** Persona (L2/L3) settings — controls scene extraction (L2) and user profile generation (L3). */
+/** Persona (L2) settings — controls scene extraction and active-scene injection. */
 export interface PersonaConfig {
   /** @deprecated L3 persona generation disabled in redesign. Field kept for backward compat. */
   triggerEveryN: number;
@@ -55,7 +55,7 @@ export interface PersonaConfig {
   backupCount: number;
   /** Scene blocks backup count (default: 10) */
   sceneBackupCount: number;
-  /** LLM model for scene extraction (L2), format: "provider/model" (falls back to OpenClaw default model when omitted). L3 persona generation disabled in redesign. */
+  /** LLM model for scene extraction (L2), format: "provider/model" (falls back to OpenClaw default model when omitted). */
   model?: string;
 
   /** Max characters per scene file. Engineering-enforced (default: 2000). */
@@ -64,7 +64,7 @@ export interface PersonaConfig {
   sceneGrowthLimit: number;
   /** Full rewrite interval in hours. UPDATEs beyond this must use write, not edit (default: 24). */
   sceneFullRewriteIntervalHours: number;
-  /** Scene TTL in days. Scenes not updated for this long are deleted (default: 30, 0=disabled). */
+  /** Scene TTL in days. Scenes whose last activity is older are archived away and stop being injected (default: 30, 0=disabled). */
   sceneTtlDays: number;
   /** Candidate pool: memory count threshold for promotion (default: 5). */
   sceneCreateThresholdMemories: number;
@@ -72,13 +72,21 @@ export interface PersonaConfig {
   sceneCreateThresholdSessions: number;
   /** Candidate pool TTL in days (default: 30). */
   sceneCandidateTtlDays: number;
-  /** L3 injection: how many top-recent scenes to inject into system prompt (default: 5). */
-  l3InjectTopK: number;
-  /** L3 injection: max summary chars per scene (default: 150). */
-  l3InjectSummaryChars: number;
+  /** @deprecated v2 L2 injects every TTL-active scene; top-K cap no longer applied. Field kept for backward compat. */
+  sceneInjectTopK: number;
+  /** @deprecated v2 L2 caps summaries at sceneSummaryMaxChars instead. Field kept for backward compat. */
+  sceneInjectSummaryChars: number;
+  /** Routing: cosine threshold for assigning a memory to a scene anchor (default: 0.55, empirically calibrated on BGE-M3 production vectors — same-topic nearest neighbors score P50≈0.73 while unrelated pairs P50≈0.48; unmatched memories safely flow to the candidate pool). */
+  sceneRoutingThreshold: number;
+  /** Hard cap for the one-line scene summary, engineering-enforced (default: 80). */
+  sceneSummaryMaxChars: number;
+  /** Summary refresh: max days before a scene with new memories gets its summary regenerated (default: 7). */
+  sceneSummaryRefreshDays: number;
+  /** Summary refresh: new-memory count that triggers regeneration regardless of age (default: 5). */
+  sceneSummaryRefreshNewMemories: number;
 }
 
-/** Pipeline trigger settings (L1→L2→L3 scheduling). */
+/** Pipeline trigger settings (L1→L2 scheduling). */
 export interface PipelineTriggerConfig {
   /** Trigger L1 after every N conversation rounds (default: 5) */
   everyNConversations: number;
@@ -106,8 +114,32 @@ export interface RecallConfig {
   maxCharsPerMemory: number;
   /** Max total characters injected for all recalled L1 memories. 0 disables the total limit. */
   maxTotalRecallChars: number;
-  /** Minimum score threshold (default: 0.3) */
+  /**
+   * Cosine-similarity threshold for the vector recall path (default: 0.55).
+   *
+   * Applies to embedding scores only. vectors.db uses sqlite-vec
+   * `distance_metric=cosine` (score = 1 - distance), so this is a true
+   * cosine similarity in [0, 1]. Empirically calibrated on the production
+   * corpus (BGE-M3 @cf/baai/bge-m3, single-user Chinese work logs, ~1000 L1
+   * memories): unrelated memory pairs score P50≈0.48 / P90≈0.58 (dense
+   * single-domain corpus — much higher than the generic BGE-M3 guidance),
+   * while real query→memory top-1 hits score P50≈0.65. 0.55 sits in the
+   * gap: keeps ~96% of queries recalling (90% cross-session) while cutting
+   * the random-pair pass rate to ~18%. Generic band reference:
+   *   0.4–0.5 wide / 0.5–0.6 balanced / 0.6–0.7 precise.
+   */
   scoreThreshold: number;
+  /**
+   * Score threshold for the FTS (BM25) recall path (default: 0.35).
+   *
+   * NOT on the cosine scale: FTS scores come from `bm25RankToScore`
+   * (`relevance / (1 + relevance)` over the raw BM25 score), whose
+   * distribution differs from cosine — applying the cosine-calibrated
+   * scoreThreshold here would over-filter keyword hits. 0.35 ≈ raw BM25 0.54
+   * (wide recall): FTS is exact-term matching, so noise risk is low and the
+   * RRF merge in hybrid mode prunes further.
+   */
+  ftsScoreThreshold: number;
   /**
    * Minimum sanitized user-text length (in Unicode code points) required to
    * trigger L1 memory search (default: 6).
@@ -371,7 +403,7 @@ export interface MemoryTdaiConfig {
   /**
    * Standalone LLM override — when enabled, TDAI bypasses the host's LLM
    * (e.g. OpenClaw's runEmbeddedPiAgent) and uses direct OpenAI-compatible
-   * API calls for L1/L2/L3 extraction.
+   * API calls for L1/L2 extraction.
    *
    * Default: disabled (uses host LLM).
    */
@@ -389,6 +421,22 @@ export interface MemoryTdaiConfig {
  */
 export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTdaiConfig {
   const c = raw ?? {};
+
+  // --- Legacy TCVDB config detection (backend removed in refactor) ---
+  // Existing user configs may still carry `storeBackend` or a `tcvdb` block.
+  // They are silently ignored otherwise; warn loudly because memories stored
+  // in TCVDB will not appear in the local SQLite store.
+  if ("storeBackend" in c || "tcvdb" in c) {
+    const parts: string[] = [];
+    if ("storeBackend" in c) parts.push(`storeBackend=${JSON.stringify(c.storeBackend)}`);
+    if ("tcvdb" in c) parts.push("tcvdb={...}");
+    console.warn(
+      `[memory-tdai] Configuration contains legacy TCVDB settings (${parts.join(", ")}) ` +
+      `that are no longer supported: the TCVDB vector backend was removed and the plugin ` +
+      `now always uses the local SQLite store. Memories previously stored in TCVDB will ` +
+      `not be visible. Remove the legacy keys from the plugin config to silence this warning.`,
+    );
+  }
 
   // --- Capture (L0) ---
   const captureGroup = obj(c, "capture");
@@ -411,7 +459,7 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
   // --- Extraction (L1) ---
   const extractionGroup = obj(c, "extraction");
 
-  // --- Persona (L2/L3) ---
+  // --- Persona (L2) ---
   const personaGroup = obj(c, "persona");
 
   // --- Pipeline ---
@@ -572,8 +620,12 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       sceneCreateThresholdMemories: num(personaGroup, "sceneCreateThresholdMemories") ?? 5,
       sceneCreateThresholdSessions: num(personaGroup, "sceneCreateThresholdSessions") ?? 3,
       sceneCandidateTtlDays: num(personaGroup, "sceneCandidateTtlDays") ?? 30,
-      l3InjectTopK: num(personaGroup, "l3InjectTopK") ?? 5,
-      l3InjectSummaryChars: num(personaGroup, "l3InjectSummaryChars") ?? 150,
+      sceneInjectTopK: num(personaGroup, "sceneInjectTopK") ?? num(personaGroup, "l3InjectTopK") ?? 5,
+      sceneInjectSummaryChars: num(personaGroup, "sceneInjectSummaryChars") ?? num(personaGroup, "l3InjectSummaryChars") ?? 150,
+      sceneRoutingThreshold: num(personaGroup, "sceneRoutingThreshold") ?? 0.55,
+      sceneSummaryMaxChars: num(personaGroup, "sceneSummaryMaxChars") ?? 80,
+      sceneSummaryRefreshDays: num(personaGroup, "sceneSummaryRefreshDays") ?? 7,
+      sceneSummaryRefreshNewMemories: num(personaGroup, "sceneSummaryRefreshNewMemories") ?? 5,
     },
     pipeline: {
       everyNConversations: num(pipelineGroup, "everyNConversations") ?? 5,
@@ -589,7 +641,8 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       maxResults: num(recallGroup, "maxResults") ?? 5,
       maxCharsPerMemory: num(recallGroup, "maxCharsPerMemory") ?? 0,
       maxTotalRecallChars: num(recallGroup, "maxTotalRecallChars") ?? 0,
-      scoreThreshold: num(recallGroup, "scoreThreshold") ?? 0.3,
+      scoreThreshold: num(recallGroup, "scoreThreshold") ?? 0.55,
+      ftsScoreThreshold: num(recallGroup, "ftsScoreThreshold") ?? 0.35,
       minQueryChars: clampMinQueryChars(num(recallGroup, "minQueryChars") ?? 6),
       strategy: validateStrategy(str(recallGroup, "strategy")) ?? "hybrid",
       timeoutMs: num(recallGroup, "timeoutMs") ?? 5000,

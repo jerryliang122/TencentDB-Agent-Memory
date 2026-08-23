@@ -98,7 +98,7 @@ export interface LLMRunner {
    *
    * Behavior depends on the factory configuration:
    * - `enableTools: false` → pure text output (used by L1 extraction, L1 dedup)
-   * - `enableTools: true`  → LLM may call file tools (used by L2 scene, L3 persona)
+   * - `enableTools: true`  → LLM may call file tools (used by L2 scene extraction)
    *
    * @returns The LLM's text response. Empty string if the LLM produces no output.
    * @throws On timeout, network errors, or unrecoverable LLM failures.
@@ -203,8 +203,6 @@ export interface RecallResult {
   appendSystemContext?: string;
   /** Recalled L1 memories with scores (for metrics). */
   recalledL1Memories?: Array<{ content: string; score: number; type: string }>;
-  /** L3 Persona content (for metrics). */
-  recalledL3Persona?: string | null;
   /** Search strategy used. */
   recallStrategy?: string;
 }

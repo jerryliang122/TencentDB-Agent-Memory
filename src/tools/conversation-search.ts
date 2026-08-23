@@ -8,6 +8,7 @@ import type { EmbeddingService } from "../core/store/embedding.js";
 import type { Logger } from "../core/types.js";
 import type { AnyAgentTool } from "openclaw/plugin-sdk/plugin-entry";
 import { rrfMerge } from "../core/search/rrf.js";
+import { report } from "../core/report/reporter.js";
 import type { MemoryToolOptions } from "./common.js";
 
 export interface ConversationSearchResultItem {
@@ -159,9 +160,11 @@ export function createConversationSearchTool(options: MemoryToolOptions): AnyAge
       required: ["query"],
     },
     async execute(_toolCallId, params) {
-      const query = String(params.query ?? "");
-      const limit = Math.min(Math.max(Number(params.limit) || 5, 1), 20);
-      const sessionKey = typeof params.session_key === "string" ? params.session_key : undefined;
+      const startMs = Date.now();
+      const p = params as Record<string, unknown>;
+      const query = String(p.query ?? "");
+      const limit = Math.min(Math.max(Number(p.limit) || 5, 1), 20);
+      const sessionKey = typeof p.session_key === "string" ? p.session_key : undefined;
 
       try {
         const result = await executeConversationSearch({
@@ -172,12 +175,31 @@ export function createConversationSearchTool(options: MemoryToolOptions): AnyAge
           embeddingService: options.embeddingService,
           logger: options.logger,
         });
+        report("tool_call", {
+          tool: "tdai_conversation_search",
+          query,
+          limit,
+          sessionKey,
+          resultCount: result.total,
+          strategy: result.strategy,
+          durationMs: Date.now() - startMs,
+          success: true,
+        });
         return {
           content: [{ type: "text", text: formatConversationSearchResponse(result) }],
           details: { count: result.total, strategy: result.strategy },
         };
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
+        report("tool_call", {
+          tool: "tdai_conversation_search",
+          query,
+          limit,
+          sessionKey,
+          durationMs: Date.now() - startMs,
+          success: false,
+          error: errMsg,
+        });
         return {
           content: [{ type: "text", text: `Conversation search failed: ${errMsg}` }],
           details: { error: errMsg },
