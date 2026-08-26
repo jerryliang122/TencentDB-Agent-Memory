@@ -260,6 +260,8 @@ The biggest risk in compression is saving tokens at the cost of losing the evide
 | Specific facts, dates, project details | L1 Atom / L0 Conversation | Widen the time range, or fall back to semantic recall when results are sparse |
 | Continuing a long-running task | Active Mermaid task canvas | Check the JSONL when the summary lacks detail, then `refs/*.md` for raw text |
 
+Scenario blocks are maintained automatically in the background (routing, promotion, summary refresh), but they are **not auto-injected into the prompt** — the agent pulls them on demand: `tdai_memory_search` results and recalled memory lines carry a `[type|scene]` tag, and `read_file scene_blocks/<scene>.md` returns the topic's memory pointer list. This keeps the context clean while preserving the macro view.
+
 The upper layers carry judgment and direction; the lower layers carry evidence and precision. Short-term compression and long-term memory form a single closed loop: **collapsible and expandable, abstract yet auditable.**
 
 ### 2. White-Box Debuggability: Memory Is Not a Black Box
