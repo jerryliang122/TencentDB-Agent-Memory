@@ -84,11 +84,6 @@ export interface Checkpoint {
   last_captured_timestamp: number;
   /** Total messages processed across all time */
   total_processed: number;
-  last_persona_at: number;
-  last_persona_time: string;
-  request_persona_update: boolean;
-  persona_update_reason: string;
-  memories_since_last_persona: number;
   scenes_processed: number;
 
   // ═══ Per-session split state ═══
@@ -127,11 +122,6 @@ const DEFAULT_PIPELINE_STATE: PipelineSessionState = {
 const DEFAULT_CHECKPOINT: Checkpoint = {
   last_captured_timestamp: 0,
   total_processed: 0,
-  last_persona_at: 0,
-  last_persona_time: "",
-  request_persona_update: false,
-  persona_update_reason: "",
-  memories_since_last_persona: 0,
   scenes_processed: 0,
   runner_states: {},
   pipeline_states: {},
@@ -200,6 +190,18 @@ export class CheckpointManager {
       // runner_states/pipeline_states objects in DEFAULT_CHECKPOINT would be
       // shared across all callers and mutated in place — corrupting the default.
       const cp = { ...structuredClone(DEFAULT_CHECKPOINT), ...parsed } as Checkpoint;
+      // Drop legacy L3-persona fields from pre-fork checkpoints (the feature
+      // was removed; without this the spread above would keep re-persisting
+      // the dead keys forever).
+      for (const legacyKey of [
+        "last_persona_at",
+        "last_persona_time",
+        "request_persona_update",
+        "persona_update_reason",
+        "memories_since_last_persona",
+      ]) {
+        delete (cp as unknown as Record<string, unknown>)[legacyKey];
+      }
 
       // Migrate from old session_states format (pre-split)
       const oldStates = parsed.session_states as Record<string, Record<string, unknown>> | undefined;
@@ -296,34 +298,6 @@ export class CheckpointManager {
   // ============================
   // Public API — mutating (all serialized via file lock)
   // ============================
-
-  // ============================
-  // Persona methods (L3)
-  // ============================
-
-  async markPersonaGenerated(totalProcessed: number): Promise<void> {
-    await this.mutate((cp) => {
-      cp.last_persona_at = totalProcessed;
-      cp.last_persona_time = new Date().toISOString();
-      cp.memories_since_last_persona = 0;
-      cp.request_persona_update = false;
-      cp.persona_update_reason = "";
-    });
-  }
-
-  async clearPersonaRequest(): Promise<void> {
-    await this.mutate((cp) => {
-      cp.request_persona_update = false;
-      cp.persona_update_reason = "";
-    });
-  }
-
-  async setPersonaUpdateRequest(reason: string): Promise<void> {
-    await this.mutate((cp) => {
-      cp.request_persona_update = true;
-      cp.persona_update_reason = reason;
-    });
-  }
 
   async incrementScenesProcessed(): Promise<void> {
     const cp = await this.mutate((cp) => {
@@ -422,7 +396,6 @@ export class CheckpointManager {
         state.last_scene_name = lastSceneName;
       }
       cp.total_memories_extracted += memoriesExtracted;
-      cp.memories_since_last_persona += memoriesExtracted;
     });
     this.logger.info(
       `[checkpoint] markL1ExtractionComplete session=${sessionKey}: ` +

@@ -14,9 +14,6 @@ export function sanitizeText(text: string): string {
 
   // Remove injected memory context tags (prevent feedback loops)
   cleaned = cleaned.replace(/<relevant-memories>[\s\S]*?<\/relevant-memories>/g, "");
-  cleaned = cleaned.replace(/<user-persona>[\s\S]*?<\/user-persona>/g, "");
-  cleaned = cleaned.replace(/<relevant-scenes>[\s\S]*?<\/relevant-scenes>/g, "");
-  cleaned = cleaned.replace(/<scene-navigation>[\s\S]*?<\/scene-navigation>/g, "");
 
   // Remove offload-injected task context blocks (MMD mermaid diagrams)
   cleaned = cleaned.replace(/<current_task_context>[\s\S]*?<\/current_task_context>/g, "");

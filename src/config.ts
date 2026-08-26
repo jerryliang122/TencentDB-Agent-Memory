@@ -47,14 +47,6 @@ export interface ExtractionConfig {
 
 /** Persona (L2) settings — controls scene extraction and active-scene injection. */
 export interface PersonaConfig {
-  /** @deprecated L3 persona generation disabled in redesign. Field kept for backward compat. */
-  triggerEveryN: number;
-  /** Max scene blocks (default: 15) — used as warning threshold only */
-  maxScenes: number;
-  /** @deprecated Persona backup count (persona generation disabled). */
-  backupCount: number;
-  /** Scene blocks backup count (default: 10) */
-  sceneBackupCount: number;
   /** LLM model for scene extraction (L2), format: "provider/model" (falls back to OpenClaw default model when omitted). */
   model?: string;
 
@@ -72,10 +64,6 @@ export interface PersonaConfig {
   sceneCreateThresholdSessions: number;
   /** Candidate pool TTL in days (default: 30). */
   sceneCandidateTtlDays: number;
-  /** @deprecated v2 L2 injects every TTL-active scene; top-K cap no longer applied. Field kept for backward compat. */
-  sceneInjectTopK: number;
-  /** @deprecated v2 L2 caps summaries at sceneSummaryMaxChars instead. Field kept for backward compat. */
-  sceneInjectSummaryChars: number;
   /** Routing: cosine threshold for assigning a memory to a scene anchor (default: 0.55, empirically calibrated on BGE-M3 production vectors — same-topic nearest neighbors score P50≈0.73 while unrelated pairs P50≈0.48; unmatched memories safely flow to the candidate pool). */
   sceneRoutingThreshold: number;
   /** Hard cap for the one-line scene summary, engineering-enforced (default: 80). */
@@ -734,10 +722,6 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       model: optStr(extractionGroup, "model"),
     },
     persona: {
-      triggerEveryN: num(personaGroup, "triggerEveryN") ?? 50,
-      maxScenes: num(personaGroup, "maxScenes") ?? 15,
-      backupCount: num(personaGroup, "backupCount") ?? 3,
-      sceneBackupCount: num(personaGroup, "sceneBackupCount") ?? 10,
       model: optStr(personaGroup, "model"),
       sceneMaxChars: num(personaGroup, "sceneMaxChars") ?? 2000,
       sceneGrowthLimit: num(personaGroup, "sceneGrowthLimit") ?? 1.5,
@@ -749,8 +733,6 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
         num(personaGroup, "sceneCandidateTtlDays"),
         30,
       ),
-      sceneInjectTopK: num(personaGroup, "sceneInjectTopK") ?? num(personaGroup, "l3InjectTopK") ?? 5,
-      sceneInjectSummaryChars: num(personaGroup, "sceneInjectSummaryChars") ?? num(personaGroup, "l3InjectSummaryChars") ?? 150,
       sceneRoutingThreshold: num(personaGroup, "sceneRoutingThreshold") ?? 0.55,
       sceneSummaryMaxChars: num(personaGroup, "sceneSummaryMaxChars") ?? 80,
       sceneSummaryRefreshDays: num(personaGroup, "sceneSummaryRefreshDays") ?? 7,

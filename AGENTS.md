@@ -92,7 +92,6 @@ src/core/
   hooks/              # auto-recall / auto-capture / recall-session（会话锚点状态）hooks
   store/              # SQLite 向量库 + embedding + BM25 + 工厂
   prompts/            # L1 提取/去重 + L2 综合提示词
-  profile/            # L2 profile 本地 ↔ store 同步
   report/             # 指标上报
   search/             # RRF merge 等共享搜索逻辑
 src/tools/            # 懒加载工具模块

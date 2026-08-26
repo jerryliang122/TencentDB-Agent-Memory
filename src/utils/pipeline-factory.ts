@@ -27,7 +27,6 @@ import { createStoreBundle } from "../core/store/factory.js";
 import type { IMemoryStore } from "../core/store/types.js";
 import type { EmbeddingService } from "../core/store/embedding.js";
 import { readManifest, writeManifest, buildStoreInfo, diffStoreBinding, type Manifest } from "./manifest.js";
-import { pullProfilesToLocal, syncLocalProfilesToStore } from "../core/profile/profile-sync.js";
 import type { Logger } from "../core/types.js";
 
 const TAG = "[memory-tdai] [pipeline-factory]";
@@ -36,10 +35,6 @@ const L0_PAGE_SIZE = 50;
 // Passing a larger group would make the extractor treat only its last 10 messages
 // as new while the runner advances the cursor past the whole group.
 const L1_MESSAGE_BATCH_SIZE = 10;
-
-function supportsProfileSyncWrite(store?: IMemoryStore): boolean {
-  return !!(store?.syncProfiles || store?.deleteProfiles);
-}
 
 // ============================
 // Logger interface
@@ -106,6 +101,18 @@ export function initDataDirectories(dataDir: string): void {
   const dirs = ["conversations", "records", "scene_blocks", ".metadata", ".backup"];
   for (const sub of dirs) {
     fs.mkdirSync(path.join(dataDir, sub), { recursive: true });
+  }
+  // One-time migration: archive the legacy L3 persona.md (generation removed
+  // with the L0–L2 redesign) so no dead artifact lingers in the data root.
+  const legacyPersona = path.join(dataDir, "persona.md");
+  if (fs.existsSync(legacyPersona)) {
+    try {
+      const archiveDir = path.join(dataDir, ".backup", "persona_legacy");
+      fs.mkdirSync(archiveDir, { recursive: true });
+      fs.renameSync(legacyPersona, path.join(archiveDir, `persona-${Date.now()}.md`));
+    } catch {
+      // Non-fatal: the file is simply inert now that nothing reads it.
+    }
   }
 }
 
@@ -502,10 +509,6 @@ export function createL2Runner(opts: {
       return;
     }
 
-    if (vectorStore?.pullProfiles && !vectorStore.isDegraded()) {
-      await pullProfilesToLocal(pluginDataDir, vectorStore, logger).catch(() => new Map());
-    }
-
     let records: Array<{ id: string; content: string; scene_name?: string; createdAt: string; updatedAt: string; sessionKey?: string }>;
 
     if (vectorStore && !vectorStore.isDegraded()) {
@@ -569,12 +572,6 @@ export function createL2Runner(opts: {
         embedding: embeddings.get(r.id),
       })),
     );
-
-    if (vectorStore && supportsProfileSyncWrite(vectorStore)) {
-      await syncLocalProfilesToStore(pluginDataDir, vectorStore, new Map(), logger).catch((err) => {
-        logger.warn?.(`${TAG} [L2] profile sync write-back failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
-      });
-    }
 
     const latestCursor = records.reduce((latest, r) => {
       return r.updatedAt > latest ? r.updatedAt : latest;

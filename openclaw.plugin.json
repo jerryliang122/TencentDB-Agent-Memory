@@ -42,8 +42,6 @@
         "type": "object",
         "description": "场景归纳设置 (L2)",
         "properties": {
-          "maxScenes": { "type": "number", "default": 15, "description": "最大场景数" },
-          "sceneBackupCount": { "type": "number", "default": 10, "description": "场景块备份保留数量" },
           "model": { "type": "string", "description": "场景生成模型 (格式: provider/model)，未填写时使用openclaw默认模型" },
           "sceneMaxChars": { "type": "number", "default": 2000, "description": "单场景文件字符上限（工程强制截断）" },
           "sceneGrowthLimit": { "type": "number", "default": 1.5, "description": "单次 UPDATE 长度增长比上限，超出 + 批次标记增多则回滚" },
@@ -52,8 +50,6 @@
           "sceneCreateThresholdMemories": { "type": "number", "default": 5, "description": "候选池提升阈值：累积 L1 记忆数" },
           "sceneCreateThresholdSessions": { "type": "number", "default": 3, "description": "候选池提升阈值：跨独立 session 数" },
           "sceneCandidateTtlDays": { "type": "number", "minimum": 0, "default": 30, "description": "候选池老化周期（天），0=不清理" },
-          "sceneInjectTopK": { "type": "number", "default": 5, "description": "@deprecated v2 L2 注入全部 TTL 内活跃场景，不再截取 top-K" },
-          "sceneInjectSummaryChars": { "type": "number", "default": 150, "description": "@deprecated v2 L2 摘要上限改由 sceneSummaryMaxChars 控制" },
           "sceneRoutingThreshold": { "type": "number", "default": 0.55, "description": "路由阈值:记忆向量与场景锚点余弦相似度达到该值才归入该场景(BGE-M3 平衡档;未匹配的记忆安全落入候选池)" },
           "sceneSummaryMaxChars": { "type": "number", "default": 80, "description": "场景一句话现状摘要的硬性字符上限（工程强制）" },
           "sceneSummaryRefreshDays": { "type": "number", "default": 7, "description": "摘要刷新周期（天）：有新记忆且距上次刷新超过该天数则重新生成" },

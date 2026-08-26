@@ -6,6 +6,17 @@
 
 ## [Unreleased]
 
+### 🗑️ 移除（彻底分叉：不再兼容上游，不回 PR）
+
+- **L3 Persona 全部残留代码清除**：本 fork 已定型为 L0–L2 三层,生成侧提示词此前已删（`persona-generation.ts`）,本次清掉其余死路径：
+  - 删除 `src/core/profile/` 整个模块——TCVDB 后端移除后 `pullProfiles/syncProfiles/deleteProfiles` 已无任何 store 实现,本地↔远端 profile 同步在本 fork 是纯死路径（连同样板类型 `ProfileRecord`/`ProfileSyncRecord` 与 `IMemoryStore` 上的可选方法、index.ts / pipeline-factory 的调用点）。
+  - 删除 `checkpoint.ts` 的 5 个 persona 状态字段（`last_persona_at` 等）与 3 个无调用方方法（`markPersonaGenerated` 等）及 `markL1ExtractionComplete` 里的死累加行;`readRaw` 加载时显式剥离旧 checkpoint 文件中的 legacy 键（数据迁移,防止 spread 合并把它们永远带回磁盘）。
+  - 删除 `scene-navigation.ts` 的 `generateSceneNavigation`/`stripSceneNavigation`（仅被已删的 profile-sync 使用）。
+  - 删除 6 个无消费方的配置字段及 schema：`persona.triggerEveryN`、`persona.backupCount`、`persona.maxScenes`、`persona.sceneBackupCount`、`persona.sceneInjectTopK`（含 `l3InjectTopK` 别名解析）、`persona.sceneInjectSummaryChars`（含 `l3InjectSummaryChars` 别名）。**配置迁移**：这些字段不再被读取,留在配置里无害但无效。
+  - 删除 `sanitize.ts` 中三个本 fork 不再产生的注入标签剥离（`<user-persona>`/`<relevant-scenes>`/`<scene-navigation>`）。
+  - 删除死代码：`auto-recall.ts` 的 `tPersona*` 计时变量与无调用方的 `searchMemoriesWithDetails`;无使用方的 barrel `src/core/index.ts` 及其独占类型（`RecallResult`/`CaptureResult`/`MemorySearchParams`/`ConversationSearchParams`）。
+  - **数据迁移**：启动时（`initDataDirectories`）将遗留的 `persona.md` 归档到 `.backup/persona_legacy/persona-<ts>.md`。
+
 ### 🐛 修复
 
 - **召回阈值（`recall.scoreThreshold`）真正在 3 条召回路径上生效**：修复 hybrid / keyword / TCVDB 原生 hybrid 路径下阈值变成"装饰"的 3 个机械缺陷。修复后语义清晰：**无强相关内容 → 不召回 L1**（active scenes 注入不变，与 L1 召回独立）。

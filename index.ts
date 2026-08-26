@@ -25,7 +25,6 @@ import { SessionFilter } from "./src/utils/session-filter.js";
 import { LocalMemoryCleaner } from "./src/utils/memory-cleaner.js";
 import { initDataDirectories, resetStores, createPipeline } from "./src/utils/pipeline-factory.js";
 import { getOrCreateInstanceId, initReporter, report, resetReporter } from "./src/core/report/reporter.js";
-import { ensureL2ProfilesLocal } from "./src/core/profile/profile-sync.js";
 import { performAutoRecall } from "./src/core/hooks/auto-recall.js";
 import { RecallSessionTracker } from "./src/core/hooks/recall-session.js";
 import type { SessionRecallParams } from "./src/core/hooks/recall-session.js";
@@ -195,11 +194,6 @@ export default definePluginEntry({
 
     if (vectorStore) {
       memoryCleaner?.setVectorStore(vectorStore);
-      if (vectorStore.pullProfiles) {
-        ensureL2ProfilesLocal(pluginDataDir, vectorStore, api.logger).catch((err) => {
-          api.logger.warn(`${TAG} Startup L2 profile pull failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
-        });
-      }
     }
   }).catch((err) => {
     api.logger.error(`${TAG} Pipeline init failed: ${err instanceof Error ? err.message : String(err)}`);

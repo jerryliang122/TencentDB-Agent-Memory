@@ -190,29 +190,6 @@ export interface StoreCapabilities {
 }
 
 // ============================
-// L2 Profile Sync Types
-// ============================
-
-/** Canonical L2 profile row shared between local cache and remote store. */
-export interface ProfileRecord {
-  /** Stable ID: `profile:v1:${sha256(scope + "\0" + type + "\0" + filename)}`. */
-  id: string;
-  type: "l2" | "l3";
-  filename: string;
-  content: string;
-  contentMd5: string;
-  agentId?: string;
-  version: number;
-  createdAtMs: number;
-  updatedAtMs: number;
-}
-
-/** Profile upsert payload with optimistic-lock baseline from the last pull. */
-export interface ProfileSyncRecord extends ProfileRecord {
-  baselineVersion?: number;
-}
-
-// ============================
 // IMemoryStore — The Core Abstraction
 // ============================
 
@@ -317,10 +294,6 @@ export interface IMemoryStore {
 
   searchL0Vector(queryEmbedding: Float32Array, topK?: number, queryText?: string): MaybePromise<L0SearchResult[]>;
   searchL0Fts(ftsQuery: string, limit?: number): MaybePromise<L0FtsResult[]>;
-
-  pullProfiles?(): Promise<ProfileRecord[]>;
-  syncProfiles?(records: ProfileSyncRecord[]): Promise<void>;
-  deleteProfiles?(recordIds: string[]): Promise<void>;
 
   // ── Re-index ─────────────────────────────────────────────
 

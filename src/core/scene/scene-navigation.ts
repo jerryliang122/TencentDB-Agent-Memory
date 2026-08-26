@@ -1,51 +1,16 @@
 /**
  * Scene navigation: view builders over the scene index.
  *
- *   generateActiveScenes  — the system-prompt injection view: every scene
+ *   generateActiveScenes  — the legacy "ambient" system-prompt injection view
+ *                           (recall.sceneInjection="ambient"): every scene
  *                           whose last_active is within TTL, sorted by
  *                           recency, unlimited count. Each entry carries
  *                           title + activity range + one-line summary +
- *                           pointer scale — the "current work themes"
- *                           awareness signal.
- *
- *   generateSceneNavigation — full index listing (all fields, absolute
- *                           paths) used by the L2 profile sync view.
+ *                           pointer scale.
  */
 
-import path from "node:path";
 import { escapeXmlTags } from "../../utils/sanitize.js";
 import type { SceneIndexEntry } from "./scene-index.js";
-
-const NAV_HEADER = "---\n## 🗺️ Scene Navigation (Scene Index)";
-
-const NAV_FOOTER = `📌 使用说明：
-- Path 是 scene block 的绝对路径，可直接使用 read_file 读取记忆指针列表
-- 记忆详情请用 tdai_memory_search 按主题关键词检索（内容都在 L1）`;
-
-export function generateSceneNavigation(entries: SceneIndexEntry[], dataDir?: string): string {
-  if (entries.length === 0) return "";
-
-  const blocks = entries.map((e) => {
-    const scenePath = dataDir
-      ? path.join(dataDir, "scene_blocks", e.filename)
-      : `scene_blocks/${e.filename}`;
-    return [
-      `### Path: ${scenePath}`,
-      `**活动时间**: ${formatRange(e.first_active, e.last_active)}`,
-      `**记忆数**: ${e.memory_count}`,
-      `Summary: ${e.summary}`,
-    ].join("\n");
-  });
-
-  return `${NAV_HEADER}\n*以下是当前场景记忆的索引，可根据需要 read_file 读取指针列表。*\n\n${blocks.join("\n\n")}\n\n${NAV_FOOTER}`;
-}
-
-/** Strip the scene navigation section from persona content. */
-export function stripSceneNavigation(personaContent: string): string {
-  const idx = personaContent.indexOf(NAV_HEADER);
-  if (idx === -1) return personaContent;
-  return personaContent.slice(0, idx).trimEnd();
-}
 
 /**
  * The system-prompt "active work themes" view.
