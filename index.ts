@@ -27,6 +27,8 @@ import { initDataDirectories, resetStores, createPipeline } from "./src/utils/pi
 import { getOrCreateInstanceId, initReporter, report, resetReporter } from "./src/core/report/reporter.js";
 import { ensureL2ProfilesLocal } from "./src/core/profile/profile-sync.js";
 import { performAutoRecall } from "./src/core/hooks/auto-recall.js";
+import { RecallSessionTracker } from "./src/core/hooks/recall-session.js";
+import type { SessionRecallParams } from "./src/core/hooks/recall-session.js";
 import { performAutoCapture } from "./src/core/hooks/auto-capture.js";
 import {
   ensurePluginHookPolicy,
@@ -53,6 +55,13 @@ const pendingRecallCache = new Map<string, {
 }>();
 const pendingRecallEndTimestamps = new Map<string, number>();
 const pendingTranscriptInjection = new Map<string, { text: string; ts: number }>();
+
+/** Session-anchored recall state (recall.sessionMode). */
+const recallSessions = new RecallSessionTracker();
+let recallSessionTtlMs = 30 * 60_000;
+
+/** Message-count drop large enough to indicate history compaction. */
+const COMPACTION_DROP_THRESHOLD = 20;
 
 const PROMPT_CACHE_TTL_MS = 10 * 60 * 1000;
 const PROMPT_CACHE_MAX_SIZE = 10_000;
@@ -99,6 +108,7 @@ function sweepStaleCaches(): void {
       pendingTranscriptInjection.delete(key);
     }
   }
+  recallSessions.sweep(recallSessionTtlMs);
 }
 
 export default definePluginEntry({
@@ -127,6 +137,15 @@ export default definePluginEntry({
   }
 
   initTimeModule({ timezone: cfg.timezone }, api.logger);
+
+  recallSessionTtlMs = cfg.recall.sessionTtlMinutes * 60_000;
+  if (cfg.recall.sessionMode !== "every-turn" && !cfg.recall.persistToTranscript) {
+    api.logger.warn(
+      `${TAG} recall.sessionMode="${cfg.recall.sessionMode}" relies on persistToTranscript to keep ` +
+      `primed memories visible on later turns; persistToTranscript=false means they are only ` +
+      `visible on the priming turn itself`,
+    );
+  }
 
   {
     const rawVersion = (api.runtime as any)?.version;
@@ -257,6 +276,10 @@ export default definePluginEntry({
 
       const rawPrompt = event.prompt;
       const messages = Array.isArray(event.messages) ? event.messages : undefined;
+      // Capture the previous turn's message count before overwriting — a sharp
+      // drop means OpenClaw compacted the history, and the memory blocks
+      // persisted in the transcript may have been summarized away.
+      const prevMessageCount = sessionKey ? pendingOriginalPrompts.get(sessionKey)?.messageCount : undefined;
       if (sessionKey && rawPrompt) {
         const messageCount = messages?.length ?? 0;
         pendingOriginalPrompts.set(sessionKey, { text: rawPrompt, ts: Date.now(), messageCount });
@@ -271,6 +294,37 @@ export default definePluginEntry({
 
       try {
         await coreReady;
+
+        // Session-anchored recall (recall.sessionMode): build the session
+        // context from the tracker. "every-turn" (legacy) bypasses the
+        // tracker entirely so the rollback path stays byte-identical.
+        let sessionParam: SessionRecallParams | undefined;
+        if (cfg.recall.sessionMode !== "every-turn") {
+          recallSessions.touch(resolvedSessionKey);
+          const state = recallSessions.get(resolvedSessionKey);
+          const messageCount = messages?.length ?? 0;
+          const compacted =
+            prevMessageCount != null && prevMessageCount - messageCount > COMPACTION_DROP_THRESHOLD;
+          if (compacted) {
+            // Transcript was compacted — reset dedup so the forced re-prime
+            // can re-inject still-relevant records.
+            recallSessions.clearRecalledIds(resolvedSessionKey);
+            api.logger.info(
+              `${TAG} [before_prompt_build] History compaction detected ` +
+              `(${prevMessageCount} → ${messageCount} messages), forcing session re-prime`,
+            );
+          }
+          sessionParam = {
+            mode: cfg.recall.sessionMode,
+            hasAnchor: recallSessions.hasAnchor(resolvedSessionKey),
+            anchorEmbedding: state?.anchorEmbedding,
+            anchorText: state?.anchorText,
+            driftThreshold: cfg.recall.driftThreshold,
+            excludeRecordIds: state ? [...state.recalledIds] : undefined,
+            forceReprime: compacted,
+          };
+        }
+
         const recallStartMs = Date.now();
         const result = await performAutoRecall({
           userText,
@@ -281,9 +335,21 @@ export default definePluginEntry({
           logger: api.logger,
           vectorStore,
           embeddingService,
+          session: sessionParam,
         });
         const elapsedMs = Date.now() - startMs;
         const recallDurationMs = Date.now() - recallStartMs;
+
+        if (result?.sessionUpdate) {
+          const su = result.sessionUpdate;
+          recallSessions.upsertAnchor(resolvedSessionKey, {
+            anchorText: su.anchorText,
+            anchorEmbedding: su.anchorEmbedding,
+          });
+          if (su.newRecordIds.length > 0) {
+            recallSessions.mergeRecalledIds(resolvedSessionKey, su.newRecordIds);
+          }
+        }
 
         if (sessionKey && result) {
           pendingRecallCache.set(sessionKey, {

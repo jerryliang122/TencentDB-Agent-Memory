@@ -19,6 +19,9 @@ import { buildFtsQuery } from "../store/sqlite.js";
 import type { EmbeddingService, EmbeddingCallOptions } from "../store/embedding.js";
 import { escapeXmlTags, sanitizeText } from "../../utils/sanitize.js";
 import type { Logger } from "../types.js";
+import { cosineSimilarity, bigramJaccard } from "../scene/scene-router.js";
+import { DRIFT_TEXT_FALLBACK_THRESHOLD } from "./recall-session.js";
+import type { SessionRecallParams, SessionRecallUpdate } from "./recall-session.js";
 
 const TAG = "[memory-tdai] [recall]";
 const RECALL_TRUNCATION_SUFFIX = "…（已截断；可用 tdai_memory_search 或 tdai_conversation_search 查看详情）";
@@ -44,7 +47,7 @@ const MEMORY_TOOLS_GUIDE = `<memory-tools-guide>
   参数：query（关键词或自然语言描述）、可选 limit/type/scene 过滤。
 - **tdai_conversation_search**：搜索原始对话（L0）。
   适用于查找具体消息原文、时间线、上下文细节；也可用于补充或校验 memory_search 的结果。
-- **read_file**(scene_blocks/<title>.md):读取 <active-scenes> 中某场景的记忆指针列表,了解该主题覆盖哪些 L1 记忆。按场景标题构造路径:scene_blocks/<title>.md
+- **read_file**(scene_blocks/<场景名>.md):读取某场景的记忆指针列表,了解该主题覆盖哪些 L1 记忆。记忆行 [type|scene] 标记中竖线后即为场景名,按场景名构造路径读取
 
 ### ⚠️ 调用次数限制
 每轮对话中，tdai_memory_get / tdai_memory_search / tdai_conversation_search **合计最多调用 5 次**。
@@ -63,7 +66,7 @@ export interface RecalledMemory {
 export interface RecallResult {
   /** L1 relevant memories — prepended to user prompt text (dynamic, per-turn) */
   prependContext?: string;
-  /** Stable recall context appended to system prompt (active scenes, tools guide — cacheable) */
+  /** Stable recall context appended to system prompt (tools guide — cacheable) */
   appendSystemContext?: string;
 
   // ── Metric payload (for pendingRecallCache in index.ts) ──
@@ -71,6 +74,10 @@ export interface RecallResult {
   recalledL1Memories?: RecalledMemory[];
   /** Effective search strategy used */
   recallStrategy?: string;
+
+  // ── Session anchoring (recall.sessionMode) ──
+  /** Anchor/injected-id bookkeeping for the caller to persist in its tracker. */
+  sessionUpdate?: SessionRecallUpdate;
 }
 
 export async function performAutoRecall(params: {
@@ -82,6 +89,8 @@ export async function performAutoRecall(params: {
   logger?: Logger;
   vectorStore?: IMemoryStore;
   embeddingService?: EmbeddingService;
+  /** Session context for `recall.sessionMode`; omit for legacy every-turn behavior. */
+  session?: SessionRecallParams;
 }): Promise<RecallResult | undefined> {
   const { cfg, logger } = params;
   const timeoutMs = cfg.recall.timeoutMs ?? 5000;
@@ -112,8 +121,9 @@ async function performAutoRecallInner(params: {
   logger?: Logger;
   vectorStore?: IMemoryStore;
   embeddingService?: EmbeddingService;
+  session?: SessionRecallParams;
 }): Promise<RecallResult | undefined> {
-  const { userText, cfg, pluginDataDir, logger, vectorStore, embeddingService } = params;
+  const { userText, cfg, pluginDataDir, logger, vectorStore, embeddingService, session } = params;
   const tRecallStart = performance.now();
 
   // Search relevant memories (L1 layer).
@@ -121,30 +131,119 @@ async function performAutoRecallInner(params: {
   //   - userText is empty/undefined, OR
   //   - sanitized text is shorter than `cfg.recall.minQueryChars` (default 6).
   // Short acknowledgments ("好的", "嗯", "ok", "对") carry no semantic intent
-  // and produce noisy recall results. Active scenes are still injected below
-  // (they are stable, cacheable context independent of the user message).
+  // and produce noisy recall results.
+  //
+  // Session modes (`recall.sessionMode`) additionally skip the search on
+  // same-topic turns: the priming injection is already persisted in the
+  // transcript, so re-running recall can only add phrasing-drift noise.
   const tSearchStart = performance.now();
   let memoryLines: string[] = [];
   let effectiveStrategy = "skipped";
   let recalledL1Memories: RecalledMemory[] = [];
   let searchTiming: SearchTiming = { ftsMs: 0, embeddingMs: 0, ftsHits: 0, embeddingHits: 0 };
-  if (!userText || userText.length === 0) {
-    logger?.debug?.(`${TAG} User text empty/undefined, skipping memory search (scenes still injected)`);
-  } else {
-    const minQueryChars = cfg.recall.minQueryChars ?? 6;
-    const cleanText = sanitizeText(userText);
-    if (cleanText.length < minQueryChars) {
+  let sessionUpdate: SessionRecallUpdate | undefined;
+
+  const searchStrategy: "keyword" | "embedding" | "hybrid" = cfg.recall.strategy ?? "hybrid";
+  const cleanText = userText ? sanitizeText(userText) : "";
+  const minQueryChars = cfg.recall.minQueryChars ?? 6;
+  const queryEligible = !!userText && userText.length > 0 && cleanText.length >= minQueryChars;
+
+  if (!queryEligible) {
+    if (!userText || userText.length === 0) {
+      logger?.debug?.(`${TAG} User text empty/undefined, skipping memory search`);
+    } else {
       logger?.info?.(
         `${TAG} User text too short for memory search ` +
         `(raw=${userText.length}, clean=${cleanText.length}, minQueryChars=${minQueryChars}), ` +
-        `skipping L1 memory search (scenes still injected)`,
+        `skipping L1 memory search`,
       );
       effectiveStrategy = "skipped-short";
-    } else {
-      effectiveStrategy = cfg.recall.strategy ?? "hybrid";
-      const searchResult = await searchMemories(userText, pluginDataDir, cfg, logger, effectiveStrategy as "keyword" | "embedding" | "hybrid", vectorStore, embeddingService);
+    }
+  } else {
+    // ── Session-mode decision: prime / skip same-topic / drift re-prime ──
+    let skipSearch = false;
+    let primeDecision: "session-first" | "drift-recall" | undefined;
+    let excludeIds: Set<string> | undefined;
+    let precomputedEmbedding: number[] | undefined;
+
+    if (session && session.mode !== "every-turn") {
+      if (!session.hasAnchor || session.forceReprime) {
+        primeDecision = session.hasAnchor ? "drift-recall" : "session-first";
+        if (session.forceReprime) excludeIds = new Set(session.excludeRecordIds ?? []);
+      } else if (session.mode === "first-turn") {
+        skipSearch = true;
+        effectiveStrategy = "session-stable";
+      } else {
+        // Drift mode: compare the current message against the session anchor.
+        const cosineMode =
+          !!embeddingService && !!session.anchorEmbedding && session.anchorEmbedding.length > 0;
+        let similarity: number | undefined;
+        let embedFailed = false;
+        if (cosineMode) {
+          try {
+            precomputedEmbedding = Array.from(
+              await embeddingService!.embed(cleanText, {
+                timeoutMs: cfg.embedding?.recallTimeoutMs ?? cfg.embedding?.timeoutMs,
+              }),
+            );
+            similarity = cosineSimilarity(precomputedEmbedding, session.anchorEmbedding!);
+          } catch (err) {
+            // Fail safe: skip recall entirely this turn — the old topic's
+            // memories stay visible and the tools remain available. A failed
+            // drift check must never become a dirty injection.
+            embedFailed = true;
+            logger?.warn?.(
+              `${TAG} Drift-check embedding failed: ${err instanceof Error ? err.message : String(err)} — skipping recall this turn`,
+            );
+          }
+        } else {
+          similarity = session.anchorText
+            ? bigramJaccard(cleanText, session.anchorText)
+            : undefined;
+        }
+
+        const sameTopic = !embedFailed && similarity != null && similarity >= (
+          cosineMode ? session.driftThreshold : DRIFT_TEXT_FALLBACK_THRESHOLD
+        );
+        if (embedFailed || sameTopic) {
+          skipSearch = true;
+          effectiveStrategy = "session-stable";
+          logger?.debug?.(
+            `${TAG} [session] same topic (similarity=${similarity?.toFixed(3) ?? "n/a"}${embedFailed ? ", embed-failed" : ""}), skipping recall`,
+          );
+        } else {
+          primeDecision = "drift-recall";
+          excludeIds = new Set(session.excludeRecordIds ?? []);
+          logger?.debug?.(
+            `${TAG} [session] drift detected (similarity=${similarity?.toFixed(3) ?? "n/a"}), re-priming with new anchor`,
+          );
+        }
+      }
+    }
+
+    if (!skipSearch) {
+      effectiveStrategy = primeDecision ?? searchStrategy;
+      const searchResult = await searchMemories(userText, pluginDataDir, cfg, logger, searchStrategy, vectorStore, embeddingService, {
+        excludeRecordIds: excludeIds,
+        precomputedEmbedding,
+      });
       memoryLines = searchResult.lines;
       searchTiming = searchResult.timing;
+
+      // Vector gate for session priming: chitchat / topics with no relevant
+      // history must pass through clean — only inject when the best vector
+      // candidate is a high-quality match.
+      if (primeDecision) {
+        const gate = cfg.recall.primingScoreThreshold ?? 0.62;
+        if (searchResult.bestVectorScore != null && searchResult.bestVectorScore < gate) {
+          logger?.debug?.(
+            `${TAG} [session] priming vector gate blocked injection ` +
+            `(bestVectorScore=${searchResult.bestVectorScore.toFixed(3)} < gate=${gate})`,
+          );
+          memoryLines = [];
+        }
+      }
+
       memoryLines = applyRecallBudget(memoryLines, cfg.recall, logger);
 
       // Extract structured RecalledMemory from formatted lines for metric reporting
@@ -158,6 +257,24 @@ async function performAutoRecallInner(params: {
         }
         return { content: line, score: 0, type: "unknown" };
       });
+
+      if (primeDecision) {
+        // Re-anchor unconditionally on a prime (even when the gate blocked
+        // injection): the next same-topic message should hit the drift skip
+        // instead of re-running the full search.
+        // `recordIds` parallels `lines`; the budget only ever drops a suffix,
+        // so slicing by the surviving line count keeps the two aligned.
+        sessionUpdate = {
+          anchorText: cleanText,
+          anchorEmbedding: searchResult.queryEmbedding
+            ? Array.from(searchResult.queryEmbedding)
+            : precomputedEmbedding,
+          newRecordIds: memoryLines.length > 0
+            ? searchResult.recordIds.slice(0, memoryLines.length)
+            : [],
+          decision: primeDecision,
+        };
+      }
     }
   }
   const tSearchEnd = performance.now();
@@ -167,27 +284,36 @@ async function performAutoRecallInner(params: {
   const tPersonaStart = performance.now();
   const tPersonaEnd = tPersonaStart;
 
-  // Load active scenes: every theme whose last_active is within TTL,
-  // sorted by recency, no count cap (TTL alone bounds the list).
+  // Load active scenes (legacy "ambient" mode only): every theme whose
+  // last_active is within TTL, sorted by recency, no count cap. The default
+  // `sceneInjection="off"` never injects scenes — scene awareness comes from
+  // the [type|scene] tag on recalled lines + on-demand tools, which keeps the
+  // system prompt byte-identical across sessions (best caching, no "hot
+  // topic" pollution in unrelated new conversations).
   const tSceneStart = performance.now();
   let activeScenesText: string | undefined;
-  try {
-    const sceneIndex = await readSceneIndex(pluginDataDir);
-    if (sceneIndex.length > 0) {
-      activeScenesText = generateActiveScenes(
-        sceneIndex,
-        cfg.persona.sceneTtlDays,
-      );
-      logger?.debug?.(
-        `${TAG} Active scenes generated: ${sceneIndex.length} indexed, ttl=${cfg.persona.sceneTtlDays}d`,
-      );
+  if (cfg.recall.sceneInjection === "ambient") {
+    try {
+      const sceneIndex = await readSceneIndex(pluginDataDir);
+      if (sceneIndex.length > 0) {
+        activeScenesText = generateActiveScenes(
+          sceneIndex,
+          cfg.persona.sceneTtlDays,
+        );
+        logger?.debug?.(
+          `${TAG} Active scenes generated: ${sceneIndex.length} indexed, ttl=${cfg.persona.sceneTtlDays}d`,
+        );
+      }
+    } catch {
+      logger?.debug?.(`${TAG} No scene index found`);
     }
-  } catch {
-    logger?.debug?.(`${TAG} No scene index found`);
   }
   const tSceneEnd = performance.now();
 
-  if (memoryLines.length === 0 && !activeScenesText) {
+  // Session modes return a result every turn (tools guide below), so only
+  // the legacy path may bail out with nothing to inject.
+  const alwaysGuide = !!session && session.mode !== "every-turn";
+  if (!alwaysGuide && memoryLines.length === 0 && !activeScenesText) {
     const totalMs = performance.now() - tRecallStart;
     logger?.info(
       `${TAG} ⏱ Recall timing: total=${totalMs.toFixed(0)}ms, ` +
@@ -227,7 +353,11 @@ async function performAutoRecallInner(params: {
   // Append memory tools usage guide to the stable part so the agent knows
   // how to actively retrieve deeper context when the injected snippets
   // are not enough. This is static content and benefits from caching.
-  if (stableParts.length > 0 || prependContext) {
+  // In session modes the guide is the only persistent system-prompt content
+  // and is returned every turn (byte-identical → prompt cache hit), so the
+  // agent always knows the retrieval tools exist — even on turns with no
+  // injection.
+  if (alwaysGuide || stableParts.length > 0 || prependContext) {
     stableParts.push(MEMORY_TOOLS_GUIDE);
   }
 
@@ -242,7 +372,7 @@ async function performAutoRecallInner(params: {
     `scene=${(tSceneEnd - tSceneStart).toFixed(0)}ms(${activeScenesText ? "loaded" : "none"})`,
   );
 
-  if (!appendSystemContext && !prependContext) {
+  if (!appendSystemContext && !prependContext && !sessionUpdate) {
     return undefined;
   }
 
@@ -251,6 +381,7 @@ async function performAutoRecallInner(params: {
     appendSystemContext,
     recalledL1Memories,
     recallStrategy: effectiveStrategy,
+    sessionUpdate,
   };
 }
 
@@ -273,7 +404,21 @@ interface SearchTiming {
 
 interface SearchResult {
   lines: string[];
+  /** record_id of each entry in `lines`, parallel array. */
+  recordIds: string[];
+  /** Best raw vector-side cosine among candidates (when the path used embeddings). */
+  bestVectorScore?: number;
+  /** The query embedding computed by the search (reusable as session anchor). */
+  queryEmbedding?: number[] | Float32Array;
   timing: SearchTiming;
+}
+
+/** Extra options threaded from session-mode recall into the search paths. */
+interface SearchOpts {
+  /** record_ids already injected this session — excluded from results. */
+  excludeRecordIds?: Set<string>;
+  /** Embedding computed by the drift check, reused to avoid a second call. */
+  precomputedEmbedding?: number[];
 }
 
 /**
@@ -327,8 +472,9 @@ async function searchMemories(
   strategy: "keyword" | "embedding" | "hybrid",
   vectorStore?: IMemoryStore,
   embeddingService?: EmbeddingService,
+  opts?: SearchOpts,
 ): Promise<SearchResult> {
-  const emptyResult: SearchResult = { lines: [], timing: { ftsMs: 0, embeddingMs: 0, ftsHits: 0, embeddingHits: 0 } };
+  const emptyResult: SearchResult = { lines: [], recordIds: [], timing: { ftsMs: 0, embeddingMs: 0, ftsHits: 0, embeddingHits: 0 } };
   // Strip gateway-injected inbound metadata (Sender, timestamps, media markers,
   // base64 image data, etc.) so FTS / embedding queries are based on pure user intent.
   const cleanText = sanitizeText(userText);
@@ -386,14 +532,20 @@ async function searchMemories(
   try {
     if (effectiveStrategy === "keyword") {
       const tFts = performance.now();
-      const lines = await searchByKeyword(cleanText, pluginDataDir, maxResults, ftsThreshold, logger, vectorStore, formatOpts);
-      return { lines, timing: { ftsMs: performance.now() - tFts, embeddingMs: 0, ftsHits: lines.length, embeddingHits: 0 } };
+      const r = await searchByKeyword(cleanText, pluginDataDir, maxResults, ftsThreshold, logger, vectorStore, formatOpts, opts?.excludeRecordIds);
+      return { lines: r.lines, recordIds: r.recordIds, timing: { ftsMs: performance.now() - tFts, embeddingMs: 0, ftsHits: r.lines.length, embeddingHits: 0 } };
     }
 
     if (effectiveStrategy === "embedding") {
       const tEmb = performance.now();
-      const lines = await searchByEmbedding(cleanText, maxResults, threshold, vectorStore!, embeddingService!, logger, embeddingCallOpts, formatOpts);
-      return { lines, timing: { ftsMs: 0, embeddingMs: performance.now() - tEmb, ftsHits: 0, embeddingHits: lines.length } };
+      const r = await searchByEmbedding(cleanText, maxResults, threshold, vectorStore!, embeddingService!, logger, embeddingCallOpts, formatOpts, opts?.precomputedEmbedding, opts?.excludeRecordIds);
+      return {
+        lines: r.lines,
+        recordIds: r.recordIds,
+        bestVectorScore: r.bestVectorScore,
+        queryEmbedding: r.queryEmbedding,
+        timing: { ftsMs: 0, embeddingMs: performance.now() - tEmb, ftsHits: 0, embeddingHits: r.lines.length },
+      };
     }
 
     // Hybrid: if the store natively supports hybrid search (e.g. TCVDB does
@@ -407,19 +559,28 @@ async function searchMemories(
       // but may not honor the user's configured scoreThreshold. Filter here
       // as the last line of defense so weak server-merged candidates don't
       // get injected when the user set a stricter threshold.
-      const results = (rawResults ?? []).filter((r) => r.score >= threshold);
+      const bestVectorScore = (rawResults ?? []).length > 0
+        ? Math.max(...(rawResults ?? []).map((r) => r.score))
+        : undefined;
+      const results = (rawResults ?? [])
+        .filter((r) => r.score >= threshold && !(opts?.excludeRecordIds?.has(r.record_id) ?? false));
       logger?.debug?.(
         `${TAG} [hybrid-native] ${rawResults?.length ?? 0} -> ${results.length} results after threshold=${threshold} filter (${nativeMs.toFixed(0)}ms)`,
       );
       if (results.length === 0) {
-        return { lines: [], timing: { ftsMs: 0, embeddingMs: nativeMs, ftsHits: 0, embeddingHits: 0 } };
+        return { lines: [], recordIds: [], bestVectorScore, timing: { ftsMs: 0, embeddingMs: nativeMs, ftsHits: 0, embeddingHits: 0 } };
       }
       const lines = results.map((r) => formatMemoryLine(vectorResultToFormatable(r), formatOpts));
-      return { lines, timing: { ftsMs: 0, embeddingMs: nativeMs, ftsHits: 0, embeddingHits: results.length } };
+      return {
+        lines,
+        recordIds: results.map((r) => r.record_id),
+        bestVectorScore,
+        timing: { ftsMs: 0, embeddingMs: nativeMs, ftsHits: 0, embeddingHits: results.length },
+      };
     }
 
     // Fallback: run keyword + embedding in parallel, merge with client-side RRF (SQLite path)
-    return await searchHybrid(cleanText, pluginDataDir, maxResults, threshold, ftsThreshold, vectorStore!, embeddingService!, logger, embeddingCallOpts, formatOpts);
+    return await searchHybrid(cleanText, pluginDataDir, maxResults, threshold, ftsThreshold, vectorStore!, embeddingService!, logger, embeddingCallOpts, formatOpts, opts);
   } catch (err) {
     logger?.warn?.(`${TAG} Memory search failed (strategy=${effectiveStrategy}): ${err instanceof Error ? err.message : String(err)}`);
     return emptyResult;
@@ -442,7 +603,9 @@ async function searchByKeyword(
   logger?: Logger,
   vectorStore?: IMemoryStore,
   formatOpts?: FormatLineOptions,
-): Promise<string[]> {
+  excludeRecordIds?: Set<string>,
+): Promise<{ lines: string[]; recordIds: string[] }> {
+  const excluded = (id: string) => excludeRecordIds?.has(id) ?? false;
   // Prefer FTS5 if available
   if (vectorStore?.isFtsAvailable()) {
     const ftsQuery = buildFtsQuery(userText);
@@ -455,12 +618,15 @@ async function searchByKeyword(
           ftsResults.map((r) => `id=${r.record_id} score=${r.score.toFixed(6)}`).join(", "),
         );
         const filtered = ftsResults
-          .filter((r) => r.score >= threshold)
+          .filter((r) => r.score >= threshold && !excluded(r.record_id))
           .slice(0, maxResults);
 
         if (filtered.length > 0) {
           logger?.debug?.(`${TAG} [keyword-fts] FTS5 found ${filtered.length} results (from ${ftsResults.length} raw, threshold=${threshold})`);
-          return filtered.map((r) => formatMemoryLine(ftsResultToFormatable(r), formatOpts ?? DEFAULT_FORMAT_OPTS));
+          return {
+            lines: filtered.map((r) => formatMemoryLine(ftsResultToFormatable(r), formatOpts ?? DEFAULT_FORMAT_OPTS)),
+            recordIds: filtered.map((r) => r.record_id),
+          };
         }
 
         // BM25 absolute scores are unreliable when the document set is very
@@ -471,19 +637,23 @@ async function searchByKeyword(
         // would return any MATCH regardless of score, defeating scoreThreshold.
         if (ftsResults.length <= maxResults) {
           const looseThreshold = threshold * 0.5;
-          const loose = ftsResults.filter((r) => r.score >= looseThreshold);
+          const loose = ftsResults.filter((r) => r.score >= looseThreshold && !excluded(r.record_id));
           if (loose.length > 0) {
             logger?.debug?.(
               `${TAG} [keyword-fts] Small docset escape hatch: ` +
               `${loose.length}/${ftsResults.length} results above loose threshold=${looseThreshold.toFixed(4)} ` +
               `(primary threshold=${threshold})`,
             );
-            return loose.slice(0, maxResults).map((r) => formatMemoryLine(ftsResultToFormatable(r), formatOpts ?? DEFAULT_FORMAT_OPTS));
+            const picked = loose.slice(0, maxResults);
+            return {
+              lines: picked.map((r) => formatMemoryLine(ftsResultToFormatable(r), formatOpts ?? DEFAULT_FORMAT_OPTS)),
+              recordIds: picked.map((r) => r.record_id),
+            };
           }
           logger?.debug?.(
             `${TAG} [keyword-fts] Small docset escape hatch: 0/${ftsResults.length} above loose threshold=${looseThreshold.toFixed(4)}, returning empty`,
           );
-          return [];
+          return { lines: [], recordIds: [] };
         }
         logger?.debug?.(`${TAG} [keyword-fts] FTS5 returned 0 results above threshold (from ${ftsResults.length} raw)`);
       }
@@ -492,7 +662,7 @@ async function searchByKeyword(
 
   // FTS5 not available or returned no results — skip in-memory fallback to avoid O(N) full scan
   logger?.debug?.(`${TAG} [keyword] FTS5 unavailable or no results, skipping keyword search`);
-  return [];
+  return { lines: [], recordIds: [] };
 }
 
 // ============================
@@ -518,11 +688,16 @@ async function searchByEmbedding(
   logger?: Logger,
   embeddingCallOpts?: EmbeddingCallOptions,
   formatOpts?: FormatLineOptions,
-): Promise<string[]> {
+  precomputedEmbedding?: number[],
+  excludeRecordIds?: Set<string>,
+): Promise<{ lines: string[]; recordIds: string[]; bestVectorScore?: number; queryEmbedding: number[] | Float32Array }> {
   logger?.debug?.(
     `${TAG} [embedding-search] START query="${userText.slice(0, 80)}...", maxResults=${maxResults}, threshold=${threshold}`,
   );
-  const queryEmbedding = await embeddingService.embed(userText, embeddingCallOpts);
+  // Reuse the drift-check embedding when provided to avoid a second call.
+  const queryEmbedding: Float32Array = precomputedEmbedding
+    ? Float32Array.from(precomputedEmbedding)
+    : await embeddingService.embed(userText, embeddingCallOpts);
   logger?.debug?.(
     `${TAG} [embedding-search] Query embedding OK: dims=${queryEmbedding.length}, ` +
     `norm=${Math.sqrt(Array.from(queryEmbedding).reduce((s, v) => s + v * v, 0)).toFixed(4)}, ` +
@@ -533,8 +708,11 @@ async function searchByEmbedding(
 
   if (vecResults.length === 0) {
     logger?.debug?.(`${TAG} [embedding-search] Returned 0 results`);
-    return [];
+    return { lines: [], recordIds: [], queryEmbedding };
   }
+
+  // Best raw candidate score (pre-filter) — feeds the session priming gate.
+  const bestVectorScore = Math.max(...vecResults.map((r) => r.score));
 
   logger?.debug?.(`${TAG} [embedding-search] Got ${vecResults.length} candidates, filtering by threshold=${threshold}`);
   for (const r of vecResults) {
@@ -545,16 +723,21 @@ async function searchByEmbedding(
   }
 
   const filtered = vecResults
-    .filter((r) => r.score >= threshold)
+    .filter((r) => r.score >= threshold && !(excludeRecordIds?.has(r.record_id) ?? false))
     .slice(0, maxResults);
 
   if (filtered.length > 0) {
     logger?.debug?.(`${TAG} [embedding-search] Found ${filtered.length} relevant memories above threshold (from ${vecResults.length} candidates)`);
-    return filtered.map((r) => formatMemoryLine(vectorResultToFormatable(r), formatOpts ?? DEFAULT_FORMAT_OPTS));
+    return {
+      lines: filtered.map((r) => formatMemoryLine(vectorResultToFormatable(r), formatOpts ?? DEFAULT_FORMAT_OPTS)),
+      recordIds: filtered.map((r) => r.record_id),
+      bestVectorScore,
+      queryEmbedding,
+    };
   }
 
   logger?.debug?.(`${TAG} [embedding-search] No results above threshold ${threshold}`);
-  return [];
+  return { lines: [], recordIds: [], bestVectorScore, queryEmbedding };
 }
 
 // ============================
@@ -586,9 +769,11 @@ async function searchHybrid(
   logger?: Logger,
   embeddingCallOpts?: EmbeddingCallOptions,
   formatOpts?: FormatLineOptions,
+  opts?: SearchOpts,
 ): Promise<SearchResult> {
   // Run keyword and embedding searches in parallel
   const candidateK = maxResults * 3; // retrieve more for merging
+  const excluded = (id: string) => opts?.excludeRecordIds?.has(id) ?? false;
 
   const [keywordResult, embeddingResult] = await Promise.all([
     // Keyword search: FTS5 only (no in-memory fallback)
@@ -604,7 +789,7 @@ async function searchHybrid(
                 logger?.debug?.(`${TAG} [hybrid-keyword-fts] FTS5 found ${ftsResults.length} candidates`);
                 // Convert FtsSearchResult to ScoredRecord for RRF merge
                 const records = ftsResults
-                  .filter((r) => r.score >= ftsThreshold)
+                  .filter((r) => r.score >= ftsThreshold && !excluded(r.record_id))
                 .map((r): ScoredRecord => ({
                   record: {
                     id: r.record_id,
@@ -638,20 +823,23 @@ async function searchHybrid(
     (async () => {
       const tStart = performance.now();
       try {
-        logger?.debug?.(`${TAG} [hybrid-embedding] Generating query embedding...`);
-        const queryEmbedding = await embeddingService.embed(userText, embeddingCallOpts);
+        // Reuse the drift-check embedding when provided to avoid a second call.
+        const queryEmbedding: Float32Array = opts?.precomputedEmbedding
+          ? Float32Array.from(opts.precomputedEmbedding)
+          : await embeddingService.embed(userText, embeddingCallOpts);
         logger?.debug?.(
           `${TAG} [hybrid-embedding] Embedding OK, dims=${queryEmbedding.length}, searching top-${candidateK}...`,
         );
         const rawResults = await vectorStore.searchL1Vector(queryEmbedding, candidateK, userText);
-        const results = rawResults.filter((r) => r.score >= threshold);
+        const bestVectorScore = rawResults.length > 0 ? Math.max(...rawResults.map((r) => r.score)) : undefined;
+        const results = rawResults.filter((r) => r.score >= threshold && !excluded(r.record_id));
         logger?.debug?.(
           `${TAG} [hybrid-embedding] Got ${rawResults.length} candidates, ${results.length} after threshold=${threshold} filter`,
         );
-        return { results, ms: performance.now() - tStart };
+        return { results, bestVectorScore, queryEmbedding, ms: performance.now() - tStart };
       } catch (err) {
         logger?.warn?.(`${TAG} Hybrid: embedding part failed: ${err instanceof Error ? err.message : String(err)}`);
-        return { results: [] as L1SearchResult[], ms: performance.now() - tStart };
+        return { results: [] as L1SearchResult[], bestVectorScore: undefined, queryEmbedding: undefined, ms: performance.now() - tStart };
       }
     })(),
   ]);
@@ -667,7 +855,7 @@ async function searchHybrid(
 
   if (keywordResults.length === 0 && embeddingResults.length === 0) {
     logger?.debug?.(`${TAG} Hybrid search: both strategies returned 0 results`);
-    return { lines: [], timing };
+    return { lines: [], recordIds: [], bestVectorScore: embeddingResult.bestVectorScore, queryEmbedding: embeddingResult.queryEmbedding, timing };
   }
 
   // RRF merge: k=60 is a standard constant from the RRF paper
@@ -712,11 +900,17 @@ async function searchHybrid(
       `${TAG} Hybrid search found ${sorted.length} results ` +
       `(keyword=${keywordResults.length}, embedding=${embeddingResults.length})`,
     );
-    return { lines: sorted.map(([, { formatable }]) => formatMemoryLine(formatable, formatOpts ?? DEFAULT_FORMAT_OPTS)), timing };
+    return {
+      lines: sorted.map(([, { formatable }]) => formatMemoryLine(formatable, formatOpts ?? DEFAULT_FORMAT_OPTS)),
+      recordIds: sorted.map(([id]) => id),
+      bestVectorScore: embeddingResult.bestVectorScore,
+      queryEmbedding: embeddingResult.queryEmbedding,
+      timing,
+    };
   }
 
   logger?.debug?.(`${TAG} Hybrid search: no results after merge`);
-  return { lines: [], timing };
+  return { lines: [], recordIds: [], bestVectorScore: embeddingResult.bestVectorScore, queryEmbedding: embeddingResult.queryEmbedding, timing };
 }
 
 // ============================

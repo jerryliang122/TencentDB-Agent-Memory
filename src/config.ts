@@ -207,6 +207,70 @@ export interface RecallConfig {
    *   `<relevant-memories>` tags in the transcript.
    */
   persistToTranscript: boolean;
+  /**
+   * In-session recall policy (default: "drift").
+   *
+   * A conversation is usually one task, so recall is anchored to the session
+   * instead of re-run with the latest message every turn (which lets phrasing
+   * drift pull in irrelevant memories):
+   *
+   * - `"drift"` (default): first qualifying message primes the session (full
+   *   recall + anchor). Later turns embed once and compare against the anchor:
+   *   same topic → no injection (memories already persisted in the
+   *   transcript); below `driftThreshold` → topic switch → re-prime with the
+   *   new anchor and inject only records not yet injected this session.
+   * - `"first-turn"`: prime once, then never recall again mid-session
+   *   (no per-turn embed). Topic switches are left to the memory tools.
+   * - `"every-turn"`: legacy behavior — every turn re-runs the full recall
+   *   pipeline with the latest message as query.
+   */
+  sessionMode: "drift" | "first-turn" | "every-turn";
+  /**
+   * Vector-score gate for session priming (default: 0.62, clamp [0, 1]).
+   *
+   * Priming injects memories only when the best vector candidate scores at
+   * or above this threshold; below it (chitchat / a topic with no relevant
+   * history) nothing is injected at all. Calibrated on the production corpus
+   * (see `scoreThreshold` docs): real query→memory top-1 hits score P50≈0.65
+   * while unrelated pairs top out around P90≈0.58 — 0.62 keeps only
+   * high-quality matches. 0.58 ≈ wide / 0.65 ≈ strict.
+   *
+   * Keyword-only deployments (no embedding service) have no vector scores to
+   * gate on and fall back to the FTS threshold path (lower precision).
+   */
+  primingScoreThreshold: number;
+  /**
+   * Cosine similarity below which a mid-session message is considered a topic
+   * switch (default: 0.5, clamp [0, 1]). Only used when `sessionMode="drift"`.
+   *
+   * Drift detection is asymmetric: a missed switch keeps the old topic's
+   * memories visible (tools can still retrieve the new topic), while a false
+   * switch re-runs recall and may inject off-topic noise — so the default
+   * leans conservative. No-embedding deployments degrade to character-bigram
+   * Jaccard with a fixed fallback threshold.
+   */
+  driftThreshold: number;
+  /**
+   * Inactivity TTL for session recall state (anchors + already-injected
+   * record ids), in minutes (default: 30, clamp [1, 1440]). After the TTL the
+   * next message re-primes the session. State is in-memory only — a process
+   * restart simply re-primes once.
+   */
+  sessionTtlMinutes: number;
+  /**
+   * Whether to auto-inject `<active-scenes>` (all TTL-active work themes)
+   * into the system prompt (default: "off").
+   *
+   * - `"off"` (default): scenes are never auto-injected. Scene awareness
+   *   comes from the `[type|scene]` tag on recalled L1 memory lines plus
+   *   on-demand tools (`tdai_memory_search`, `read_file scene_blocks/…`).
+   *   This keeps the system prompt byte-identical across sessions and turns
+   *   (best prompt-cache behavior) and stops unrelated "hot topics" from
+   *   polluting new conversations.
+   * - `"ambient"`: legacy behavior — every active scene within
+   *   `persona.sceneTtlDays` is injected into the system prompt each turn.
+   */
+  sceneInjection: "off" | "ambient";
 }
 
 /** Embedding service configuration for vector search. */
@@ -714,6 +778,11 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       subjectOnly: bool(recallGroup, "subjectOnly") ?? true,
       subjectHintChars: clampSubjectHintChars(num(recallGroup, "subjectHintChars") ?? 60),
       persistToTranscript: bool(recallGroup, "persistToTranscript") ?? true,
+      sessionMode: validateSessionMode(str(recallGroup, "sessionMode")) ?? "drift",
+      primingScoreThreshold: numberInRange(num(recallGroup, "primingScoreThreshold"), 0, 1, 0.62),
+      driftThreshold: numberInRange(num(recallGroup, "driftThreshold"), 0, 1, 0.5),
+      sessionTtlMinutes: positiveInteger(num(recallGroup, "sessionTtlMinutes"), 30, 1440),
+      sceneInjection: validateSceneInjection(str(recallGroup, "sceneInjection")) ?? "off",
     },
     embedding: {
       enabled: embeddingEnabled,
@@ -827,6 +896,10 @@ function strArray(src: Record<string, unknown>, key: string): string[] | undefin
 
 const VALID_STRATEGIES: RecallConfig["strategy"][] = ["embedding", "keyword", "hybrid"];
 
+const VALID_SESSION_MODES: RecallConfig["sessionMode"][] = ["drift", "first-turn", "every-turn"];
+
+const VALID_SCENE_INJECTIONS: RecallConfig["sceneInjection"][] = ["off", "ambient"];
+
 /**
  * Validate recall strategy against whitelist.
  * Returns the strategy if valid, undefined otherwise (caller falls back to default).
@@ -835,6 +908,22 @@ function validateStrategy(value: string | undefined): RecallConfig["strategy"] |
   if (!value) return undefined;
   return VALID_STRATEGIES.includes(value as RecallConfig["strategy"])
     ? (value as RecallConfig["strategy"])
+    : undefined;
+}
+
+/** Validate `recall.sessionMode` against whitelist (invalid → default "drift"). */
+function validateSessionMode(value: string | undefined): RecallConfig["sessionMode"] | undefined {
+  if (!value) return undefined;
+  return VALID_SESSION_MODES.includes(value as RecallConfig["sessionMode"])
+    ? (value as RecallConfig["sessionMode"])
+    : undefined;
+}
+
+/** Validate `recall.sceneInjection` against whitelist (invalid → default "off"). */
+function validateSceneInjection(value: string | undefined): RecallConfig["sceneInjection"] | undefined {
+  if (!value) return undefined;
+  return VALID_SCENE_INJECTIONS.includes(value as RecallConfig["sceneInjection"])
+    ? (value as RecallConfig["sceneInjection"])
     : undefined;
 }
 
