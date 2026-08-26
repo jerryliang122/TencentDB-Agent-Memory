@@ -23,6 +23,13 @@
 
 ### ✨ 新功能
 
+- **自动召回重设计：会话锚定 priming + 漂移检测 + 向量闸门（场景块退出自动注入）**：旧模式每轮用最新消息做查询重新召回——同一会话通常是一个任务，措辞漂移会把无关记忆混进 prompt；且 `persistToTranscript=true` 下首轮注入已持久化在转录里，后续重召回只有坏处。新架构让 LLM 无需用户说"回忆一下"就自动获得**当前会话相关**的过往知识，闲聊与无关新话题零污染。
+  - **会话 priming**（`recall.sessionMode`，默认 `"drift"`）：首条通过 `minQueryChars` 的消息做一次 hybrid 召回，**向量闸门** `recall.primingScoreThreshold`（默认 `0.62`，BGE-M3 生产校准：真实命中 P50≈0.65 / 无关对 P90≈0.58）达标才注入，否则整体放过；锚点（首条消息 embedding + 已注入 record_id）存入内存 `RecallSessionTracker`（TTL `recall.sessionTtlMinutes` 默认 30 分钟不活动过期）。
+  - **漂移检测**：后续每轮 embed 当前消息与锚点比余弦——≥ `recall.driftThreshold`（默认 `0.5`）同话题 → 完全不注入；低于阈值 → 换话题：无条件重锚点 + 重新 priming（闸门同样生效），按 record_id 去重只注入本会话未注入过的新增记忆。漂移 embed 失败**保守跳过**（宁可不召回也不注入噪声）；无 embedding 部署退化 bigram 文本相似度；检测到历史压缩（消息数骤降 >20）强制重 priming 并重置去重。
+  - **场景块（L2）退出自动注入**：`recall.sceneInjection` 默认 `"off"`，`<active-scenes>` 不再注入 system prompt——场景感知来自召回行的 `[type|scene]` 标记 + 工具按需检索。system prompt 跨会话字节一致（prompt cache 最优，`/new` 开新任务不再被无关热点主题污染）。
+  - **配置迁移**：未配置新字段的用户默认获得新行为；要完整回退旧行为需显式设置 `recall.sessionMode: "every-turn"` + `recall.sceneInjection: "ambient"`（every-turn 模式不经过会话 tracker，行为与旧版逐字节一致）。
+  - **指标**：`recallStrategy` 新增 `session-first` / `session-stable` / `drift-recall` 标签，便于从日志观察三类轮次分布、按实际漂移误判率调优阈值。
+  - 新增模块 `src/core/hooks/recall-session.ts`；新增 35 个单测覆盖 priming / 闸门 / 漂移 / 去重 / 失败安全 / 回退路径。
 - **L1 自动召回注入格式改造（subject-only 模式）**：召回的 L1 记忆不再注入完整 `content`，改为紧凑的"主题 + 内容首段提示 + record_id"单行格式：
   ```
   - [type|scene_name] <content 首 N 字 + "…"> (活动时间: ...) [id=m_xxx]

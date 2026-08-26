@@ -142,7 +142,7 @@ openclaw gateway restart
 }
 ```
 
-启用后，TencentDB Agent Memory 会自动完成对话录制、记忆提取、场景归纳和下一轮对话前召回。
+启用后，TencentDB Agent Memory 会自动完成对话录制、记忆提取、场景归纳，并以**会话锚定**方式召回：会话首条消息在高质量向量闸门保护下把相关过往知识 priming 进 prompt（闲聊与无关新话题完全放过、零污染），后续轮次只有检测到话题漂移才会再次注入。
 
 ### 启用短期记忆压缩（可选，要求版本 ≥ 0.3.4）
 
@@ -185,8 +185,8 @@ openclaw gateway restart
 | `recall.strategy` | `"hybrid"` | 召回策略：`keyword` / `embedding` / `hybrid`（RRF 融合，推荐） |
 | `recall.maxResults` | `5` | 每次召回条数 |
 | `recall.maxCharsPerMemory` | `0` | 单条 L1 记忆注入的最大字符数；`0` 表示不限制 |
-| `recall.maxTotalRecallChars` | `0` | 每轮 auto-recall 注入的 L1 记忆总字符预算；`0` 表示不限制 |
-| `recall.minQueryChars` | `6` | 触发 L1 记忆搜索的最小用户文本长度（Unicode 码点）。更短的消息（如 "好的"、"嗯"、"ok"、"对"）跳过 L1 搜索；活跃场景仍会注入。`0` 关闭此门控；`2` 恢复历史硬限 |
+| `recall.maxTotalRecallChars` | `0` | 单次 auto-recall 注入的 L1 记忆总字符预算；`0` 表示不限制 |
+| `recall.minQueryChars` | `6` | 触发 L1 记忆搜索的最小用户文本长度（Unicode 码点）。更短的消息（如 "好的"、"嗯"、"ok"、"对"）跳过 L1 搜索。`0` 关闭此门控；`2` 恢复历史硬限 |
 | `pipeline.everyNConversations` | `5` | 每 N 轮对话触发一次 L1 记忆提取 |
 | `extraction.maxMemoriesPerSession` | `20` | 单次 L1 最多提取多少条 |
 | `offload.enabled` | `false` | 是否启用短期记忆压缩 |
@@ -202,6 +202,11 @@ openclaw gateway restart
 | `pipeline.l1IdleTimeoutSeconds` | `600` | 用户停止对话多久后触发 L1 |
 | `pipeline.l2MinIntervalSeconds` | `900` | 同 session 两次 L2 之间的最小间隔 |
 | `recall.timeoutMs` | `5000` | 召回超时阈值，超时跳过注入不阻塞对话 |
+| `recall.sessionMode` | `"drift"` | 会话内召回策略。一个会话通常是一个任务：`drift`（默认）在首条有效消息上做一次 priming，后续每轮只与锚点做漂移比较——同话题不注入（priming 块已持久化在转录里），换话题才重新 priming 并只注入本会话未注入过的新增记忆；`first-turn` priming 一次后会话内不再召回；`every-turn` 恢复旧的逐轮完整召回（回退开关） |
+| `recall.primingScoreThreshold` | `0.62` | 会话 priming 的向量分数闸门：候选最高向量分达到该值才注入记忆——闲聊、无相关历史的新话题完全放过。BGE-M3 校准（`0.58` 宽 / `0.65` 严） |
+| `recall.driftThreshold` | `0.5` | 会话中途消息与锚点的余弦低于该值视为换话题（仅 drift 模式）。漏检只是保留旧话题记忆（工具可补查），误检才会注入噪声——因此默认偏保守 |
+| `recall.sessionTtlMinutes` | `30` | 会话召回状态（锚点 + 已注入记录 id）的不活动过期时间，过期后下一条消息重新 priming。仅存内存 |
+| `recall.sceneInjection` | `"off"` | 是否自动注入 `<active-scenes>`（全部 TTL 内活跃工作主题）到 system prompt。`off`（默认）不注入——场景感知来自召回行的 `[type\|scene]` 标记 + 工具按需检索，system prompt 跨会话字节一致（缓存最优，`/new` 后不被无关热点主题污染）；`ambient` 恢复旧行为 |
 | `extraction.enableDedup` | `true` | L1 向量去重 / 冲突检测 |
 | `capture.excludeAgents` | `[]` | Glob 模式排除特定 Agent（如 `bench-judge-*`） |
 | `capture.l0l1RetentionDays` | `0` | L0/L1 本地文件保留天数，`0` = 永不清理 |
