@@ -455,6 +455,6 @@ describe("parseConfig BGE-M3 calibrated defaults", () => {
     const cfg = parseConfig(undefined);
     expect(cfg.recall.scoreThreshold).toBe(0.55);
     expect(cfg.recall.ftsScoreThreshold).toBe(0.35);
-    expect(cfg.persona.sceneRoutingThreshold).toBe(0.55);
+    expect(cfg.scene.sceneRoutingThreshold).toBe(0.55);
   });
 });

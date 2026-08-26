@@ -94,21 +94,21 @@ describe("parseConfig numeric safety guards", () => {
   });
 
   it.each([-1, Number.NaN, Number.NEGATIVE_INFINITY])(
-    "falls back for invalid persona.sceneCandidateTtlDays=%s",
+    "falls back for invalid scene.sceneCandidateTtlDays=%s",
     (value) => {
-      const cfg = parseConfig({ persona: { sceneCandidateTtlDays: value } });
-      expect(cfg.persona.sceneCandidateTtlDays).toBe(30);
+      const cfg = parseConfig({ scene: { sceneCandidateTtlDays: value } });
+      expect(cfg.scene.sceneCandidateTtlDays).toBe(30);
     },
   );
 
   it("preserves zero as the candidate TTL cleanup off switch", () => {
-    const cfg = parseConfig({ persona: { sceneCandidateTtlDays: 0 } });
-    expect(cfg.persona.sceneCandidateTtlDays).toBe(0);
+    const cfg = parseConfig({ scene: { sceneCandidateTtlDays: 0 } });
+    expect(cfg.scene.sceneCandidateTtlDays).toBe(0);
   });
 
   it("preserves a positive fractional candidate TTL", () => {
-    const cfg = parseConfig({ persona: { sceneCandidateTtlDays: 0.5 } });
-    expect(cfg.persona.sceneCandidateTtlDays).toBe(0.5);
+    const cfg = parseConfig({ scene: { sceneCandidateTtlDays: 0.5 } });
+    expect(cfg.scene.sceneCandidateTtlDays).toBe(0.5);
   });
 
   it.each([-1, MAX_TIMER_SECONDS + 1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(

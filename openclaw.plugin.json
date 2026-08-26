@@ -38,7 +38,7 @@
           "model": { "type": "string", "description": "提取使用模型 (格式: provider/model)，未填写时使用openclaw默认模型" }
         }
       },
-      "persona": {
+      "scene": {
         "type": "object",
         "description": "场景归纳设置 (L2)",
         "properties": {

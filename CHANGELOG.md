@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 
+### ✨ 新功能
+
+- **配置段更名:`persona` → `scene`**：L3 清除后该段剩余 12 个字段全部是 L2 场景配置,段名纯属历史遗留。`PersonaConfig` → `SceneConfig`、`cfg.persona.*` → `cfg.scene.*`、schema 段同步更名。**配置迁移**：`openclaw.json` 中把 `"persona": { ... }` 改为 `"scene": { ... }`（段内字段名不变）;按分叉原则不保留 `persona` 别名解析,未改名则全部走默认值。注意:L1 记忆类型 `persona`（`persona|episodic|instruction` 三类标签之一）与配置段无关,不受影响。
+
 ### 🗑️ 移除（彻底分叉：不再兼容上游，不回 PR）
 
 - **L3 Persona 全部残留代码清除**：本 fork 已定型为 L0–L2 三层,生成侧提示词此前已删（`persona-generation.ts`）,本次清掉其余死路径：

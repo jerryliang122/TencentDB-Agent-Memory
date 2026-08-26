@@ -99,7 +99,7 @@ function makeEmbedder(vectors: Record<string, number[]>, fallback: number[] = [0
   return { svc: { embed } as unknown as EmbeddingService, embed };
 }
 
-function makeCfg(recallOverrides: Partial<MemoryTdaiConfig["recall"]> = {}, persona?: Partial<MemoryTdaiConfig["persona"]>) {
+function makeCfg(recallOverrides: Partial<MemoryTdaiConfig["recall"]> = {}, persona?: Partial<MemoryTdaiConfig["scene"]>) {
   return {
     recall: {
       enabled: true,
@@ -121,7 +121,7 @@ function makeCfg(recallOverrides: Partial<MemoryTdaiConfig["recall"]> = {}, pers
       sceneInjection: "off",
       ...recallOverrides,
     },
-    persona: { sceneTtlDays: 30, ...persona },
+    scene: { sceneTtlDays: 30, ...persona },
   } as unknown as MemoryTdaiConfig;
 }
 

@@ -293,10 +293,10 @@ async function performAutoRecallInner(params: {
       if (sceneIndex.length > 0) {
         activeScenesText = generateActiveScenes(
           sceneIndex,
-          cfg.persona.sceneTtlDays,
+          cfg.scene.sceneTtlDays,
         );
         logger?.debug?.(
-          `${TAG} Active scenes generated: ${sceneIndex.length} indexed, ttl=${cfg.persona.sceneTtlDays}d`,
+          `${TAG} Active scenes generated: ${sceneIndex.length} indexed, ttl=${cfg.scene.sceneTtlDays}d`,
         );
       }
     } catch {

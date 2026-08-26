@@ -548,18 +548,18 @@ export function createL2Runner(opts: {
     const consolidator = new SceneConsolidator({
       dataDir: pluginDataDir,
       config: openclawConfig,
-      model: cfg.persona.model,
+      model: cfg.scene.model,
       llmRunner,
       embeddingService,
       logger,
-      ttlDays: cfg.persona.sceneTtlDays,
-      routingThreshold: cfg.persona.sceneRoutingThreshold,
-      promoteThresholdMemories: cfg.persona.sceneCreateThresholdMemories,
-      promoteThresholdSessions: cfg.persona.sceneCreateThresholdSessions,
-      candidateTtlDays: cfg.persona.sceneCandidateTtlDays,
-      summaryRefreshDays: cfg.persona.sceneSummaryRefreshDays,
-      summaryRefreshNewMemories: cfg.persona.sceneSummaryRefreshNewMemories,
-      summaryMaxChars: cfg.persona.sceneSummaryMaxChars,
+      ttlDays: cfg.scene.sceneTtlDays,
+      routingThreshold: cfg.scene.sceneRoutingThreshold,
+      promoteThresholdMemories: cfg.scene.sceneCreateThresholdMemories,
+      promoteThresholdSessions: cfg.scene.sceneCreateThresholdSessions,
+      candidateTtlDays: cfg.scene.sceneCandidateTtlDays,
+      summaryRefreshDays: cfg.scene.sceneSummaryRefreshDays,
+      summaryRefreshNewMemories: cfg.scene.sceneSummaryRefreshNewMemories,
+      summaryMaxChars: cfg.scene.sceneSummaryMaxChars,
     });
 
     await consolidator.consolidate(

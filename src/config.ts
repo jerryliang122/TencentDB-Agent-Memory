@@ -45,8 +45,8 @@ export interface ExtractionConfig {
   model?: string;
 }
 
-/** Persona (L2) settings — controls scene extraction and active-scene injection. */
-export interface PersonaConfig {
+/** Scene (L2) settings — controls scene block extraction, routing, and TTL. */
+export interface SceneConfig {
   /** LLM model for scene extraction (L2), format: "provider/model" (falls back to OpenClaw default model when omitted). */
   model?: string;
 
@@ -256,7 +256,7 @@ export interface RecallConfig {
    *   (best prompt-cache behavior) and stops unrelated "hot topics" from
    *   polluting new conversations.
    * - `"ambient"`: legacy behavior — every active scene within
-   *   `persona.sceneTtlDays` is injected into the system prompt each turn.
+   *   `scene.sceneTtlDays` is injected into the system prompt each turn.
    */
   sceneInjection: "off" | "ambient";
 }
@@ -443,7 +443,7 @@ export interface MemoryTdaiConfig {
   timezone: string;
   capture: CaptureConfig;
   extraction: ExtractionConfig;
-  persona: PersonaConfig;
+  scene: SceneConfig;
   pipeline: PipelineTriggerConfig;
   recall: RecallConfig;
   embedding: EmbeddingConfig;
@@ -512,7 +512,7 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
   const extractionGroup = obj(c, "extraction");
 
   // --- Persona (L2) ---
-  const personaGroup = obj(c, "persona");
+  const sceneGroup = obj(c, "scene");
 
   // --- Pipeline ---
   const pipelineGroup = obj(c, "pipeline");
@@ -721,22 +721,22 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       ),
       model: optStr(extractionGroup, "model"),
     },
-    persona: {
-      model: optStr(personaGroup, "model"),
-      sceneMaxChars: num(personaGroup, "sceneMaxChars") ?? 2000,
-      sceneGrowthLimit: num(personaGroup, "sceneGrowthLimit") ?? 1.5,
-      sceneFullRewriteIntervalHours: num(personaGroup, "sceneFullRewriteIntervalHours") ?? 24,
-      sceneTtlDays: num(personaGroup, "sceneTtlDays") ?? 30,
-      sceneCreateThresholdMemories: num(personaGroup, "sceneCreateThresholdMemories") ?? 5,
-      sceneCreateThresholdSessions: num(personaGroup, "sceneCreateThresholdSessions") ?? 3,
+    scene: {
+      model: optStr(sceneGroup, "model"),
+      sceneMaxChars: num(sceneGroup, "sceneMaxChars") ?? 2000,
+      sceneGrowthLimit: num(sceneGroup, "sceneGrowthLimit") ?? 1.5,
+      sceneFullRewriteIntervalHours: num(sceneGroup, "sceneFullRewriteIntervalHours") ?? 24,
+      sceneTtlDays: num(sceneGroup, "sceneTtlDays") ?? 30,
+      sceneCreateThresholdMemories: num(sceneGroup, "sceneCreateThresholdMemories") ?? 5,
+      sceneCreateThresholdSessions: num(sceneGroup, "sceneCreateThresholdSessions") ?? 3,
       sceneCandidateTtlDays: nonNegativeNumber(
-        num(personaGroup, "sceneCandidateTtlDays"),
+        num(sceneGroup, "sceneCandidateTtlDays"),
         30,
       ),
-      sceneRoutingThreshold: num(personaGroup, "sceneRoutingThreshold") ?? 0.55,
-      sceneSummaryMaxChars: num(personaGroup, "sceneSummaryMaxChars") ?? 80,
-      sceneSummaryRefreshDays: num(personaGroup, "sceneSummaryRefreshDays") ?? 7,
-      sceneSummaryRefreshNewMemories: num(personaGroup, "sceneSummaryRefreshNewMemories") ?? 5,
+      sceneRoutingThreshold: num(sceneGroup, "sceneRoutingThreshold") ?? 0.55,
+      sceneSummaryMaxChars: num(sceneGroup, "sceneSummaryMaxChars") ?? 80,
+      sceneSummaryRefreshDays: num(sceneGroup, "sceneSummaryRefreshDays") ?? 7,
+      sceneSummaryRefreshNewMemories: num(sceneGroup, "sceneSummaryRefreshNewMemories") ?? 5,
     },
     pipeline: {
       everyNConversations: num(pipelineGroup, "everyNConversations") ?? 5,

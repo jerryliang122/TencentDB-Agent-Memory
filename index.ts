@@ -214,8 +214,8 @@ export default definePluginEntry({
         retentionDays: cfg.memoryCleanup.retentionDays,
         cleanTime: cfg.memoryCleanup.cleanTime,
         logger: api.logger,
-        sceneTtlDays: cfg.persona.sceneTtlDays,
-        sceneCandidateTtlDays: cfg.persona.sceneCandidateTtlDays,
+        sceneTtlDays: cfg.scene.sceneTtlDays,
+        sceneCandidateTtlDays: cfg.scene.sceneCandidateTtlDays,
       });
       sharedMemoryCleaner.start();
     }
