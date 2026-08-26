@@ -14,6 +14,7 @@ npm run build                  # 构建插件 (tsdown)
 npm run test                   # 运行单元测试 (vitest)
 npm run test:watch             # 监视模式
 npm run test:coverage          # 覆盖率报告
+npm run typecheck              # 类型检查 (tsc --noEmit)
 ```
 
 ## 开发
@@ -44,9 +45,9 @@ agent 回合结束 ──► agent_end (auto-capture)      ──► 写 L0
 
 ### 写路径
 
-- **L0 捕获**（`agent_end` → `src/core/hooks/auto-capture.ts`）：新消息在 checkpoint 文件锁下原子写入 JSONL（`conversations/YYYY-MM-DD.jsonl`）和 SQLite L0 表。SQLite 路径先写元数据 + FTS，embedding 后台异步补齐。游标防重复，插件启动时间做首启下限。
-- **调度**（`src/utils/pipeline-manager.ts`）：L1 按对话轮数阈值（warmup 1→2→4→8→5）或空闲超时触发，失败重试 30s×5；L2 用 downward-only 定时器（L1 后延迟 10s、minInterval 15min 下限、maxInterval 60min 兜底），会话 24h 不活跃停止轮询。所有任务走 `SerialQueue`（并发=1），状态持久化到 checkpoint 可恢复。
-- **L1 提取**（`src/core/record/l1-extractor.ts`）：单次 LLM JSON-mode 调用同时做场景分段 + 记忆提取；质量门过滤短消息/命令/注入风险；`batchDedup` 向量召回 top-5 相似旧记忆做冲突检测（新增/合并/丢弃）。结果写 `records/` JSONL + SQLite L1 表（带向量索引）。
+- **L0 捕获**（`agent_end` → `src/core/hooks/auto-capture.ts`）：JSONL（`conversations/YYYY-MM-DD.jsonl`）与游标在 checkpoint 文件锁下原子写入；SQLite L0 写入在锁外，靠每条记录唯一 ID 幂等去重。SQLite 路径先写元数据 + FTS，embedding 后台异步补齐。游标防重复，插件启动时间做首启下限。
+- **调度**（`src/utils/pipeline-manager.ts`）：L1 按对话轮数阈值（warmup 1→2→4→…，封顶 everyN=5）或空闲超时触发，失败重试 30s×5；L2 用 downward-only 定时器（L1 后延迟 10s、minInterval 15min 下限、maxInterval 60min 兜底），会话 24h 不活跃停止轮询。所有任务走 `SerialQueue`（并发=1），状态持久化到 checkpoint 可恢复。
+- **L1 提取**（`src/core/record/l1-extractor.ts`）：单次 LLM JSON-mode 调用同时做场景分段 + 记忆提取；质量门过滤纯符号短串/命令/注入风险（长度门已禁用）；`batchDedup` 向量召回 top-5 相似旧记忆做冲突检测（新增/合并/丢弃）。结果写 `records/` JSONL + SQLite L1 表（带向量索引）。
 - **L2 场景归纳**（`src/core/scene/`，v2 设计：**工程路由 + LLM 单次综合，稳态零 LLM**）：
   - **路由**（`scene-router.ts`）：新 L1 记忆按 embedding 余弦相似度分配给场景锚点（`scene_state.json` 维护滚动均值锚点，阈值 `sceneRoutingThreshold` 默认 0.55），无 embedding 时退化为 bigram 文本相似度
   - **候选池**（`scene-candidates.ts`）：路由无匹配的记忆累积进候选；≥5 条相似记忆或 ≥3 个 session → 升级为场景块（升级时 LLM 生成标题+摘要，一次调用）；30 天无新证据过期
@@ -58,7 +59,7 @@ agent 回合结束 ──► agent_end (auto-capture)      ──► 写 L0
 ### 读路径
 
 - **自动召回**（`before_prompt_build` → `src/core/hooks/auto-recall.ts`，5s 超时保护）：按策略搜索 L1 —— keyword（FTS5 BM25）/ embedding（余弦）/ hybrid（默认，RRF k=60 合并）。阈值按 BGE-M3 校准且分路解耦：向量 `scoreThreshold`（默认 0.55，实测校准）、FTS `ftsScoreThreshold`（默认 0.35，BM25 归一化分度尺，与余弦不可比）。注入分两段：
-  - `<relevant-memories>`（动态，每轮变）→ 前置到**用户 prompt**，不破坏 system prompt 缓存
+  - `<relevant-memories>`（动态，每轮变）→ 前置到**用户 prompt**，不破坏 system prompt 缓存；`persistToTranscript` 默认开启时由 `before_message_write` hook 持久化写入用户消息 JSONL，而非仅运行时 prompt 前缀
   - `<active-scenes>`（TTL 内全部活跃工作主题：标题+活动区间+一句话现状+记忆条数，不限个数、按最近活动排序）+ 工具指南（稳定）→ 追加到 **system prompt 尾部**，命中 prompt cache
   - 注入行是紧凑格式：`[type|scene] 内容前 60 字提示 [id=m_xxx]`，agent 按需取全文
 - **主动检索工具**（`src/tools/`）：`tdai_memory_search`（L1 hybrid 搜索）、`tdai_memory_get`（按 record_id 取全文）、`tdai_conversation_search`（L0 原文检索）。指南限制每轮合计最多 5 次调用。
@@ -87,7 +88,7 @@ src/core/
     scene-index.ts        # scene_index.json 读写/重建
   hooks/              # auto-recall / auto-capture hooks
   store/              # SQLite 向量库 + embedding + BM25 + 工厂
-  prompts/            # L1 提取 + L2 综合提示词
+  prompts/            # L1 提取/去重 + L2 综合提示词
   profile/            # L2 profile 本地 ↔ store 同步
   report/             # 指标上报
   search/             # RRF merge 等共享搜索逻辑
@@ -103,12 +104,12 @@ src/utils/
 src/offload/          # 上下文压缩（Mermaid 画布，独立可选功能）
 ```
 
-**模式**: 入口点直接使用 `createPipeline()`, `performAutoRecall()`, `performAutoCapture()` 等 factory 函数，通过 `api.registerTool()` 注册工具。hooks：`before_prompt_build`（召回）、`agent_end`（捕获）、`gateway_stop`（3s 超时优雅关闭）。
+**模式**: 入口点直接使用 `createPipeline()`, `performAutoRecall()`, `performAutoCapture()` 等 factory 函数，通过 `api.registerTool()` 注册工具。hooks：`before_prompt_build`（召回）、`before_message_write`（持久化/清除 `<relevant-memories>` 注入）、`agent_end`（捕获）、`gateway_stop`（3s 超时优雅关闭）。
 
 ## 测试
 
 - 单元测试: `src/**/*.test.ts`
-- E2E 测试: `**/*.e2e.test.ts`（独立配置 `vitest.e2e.config.ts`）
+- E2E: 独立配置 `vitest.e2e.config.ts` 保留，但当前仓库暂无 `*.e2e.test.ts` 测试文件
 - 测试超时: 120s（长时间运行的 LLM/embedding 测试）
 
 ## 提交
