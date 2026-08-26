@@ -125,9 +125,9 @@ export function shouldCaptureL0(text: string): boolean {
  * L1 extraction filter — **strict** quality gate.
  *
  * Applied when L0 messages are fed into the LLM extraction pipeline.
- * Filters out content that is too short, too long, purely symbolic,
- * or looks like a prompt-injection attack — none of which should
- * become structured memories.
+ * Filters out purely symbolic strings, runs of "?" characters, and
+ * content that looks like a prompt-injection attack — none of which
+ * should become structured memories.
  *
  * This function is a superset of {@link shouldCaptureL0}: anything
  * rejected by L0 is also rejected here, plus additional quality checks.
