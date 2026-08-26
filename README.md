@@ -145,7 +145,7 @@ Defaults to a local `SQLite + sqlite-vec` backend.
 }
 ```
 
-Once enabled, TencentDB Agent Memory automatically handles conversation capture, memory extraction, scene consolidation, and recall before the next turn.
+Once enabled, TencentDB Agent Memory automatically handles conversation capture, memory extraction, scene consolidation, and session-anchored recall: the first message of a conversation primes relevant past knowledge into the prompt behind a high-similarity vector gate (chitchat and unrelated topics pass through clean), and later turns stay silent unless the topic drifts.
 
 ### Enable short-term compression (optional, requires version ≥ 0.3.4)
 
@@ -189,7 +189,7 @@ Register the slot in your plugin config so OpenClaw routes context-offload reque
 | `recall.maxResults` | `5` | Number of items returned per recall |
 | `recall.maxCharsPerMemory` | `0` | Max characters injected for one recalled L1 memory; `0` disables this guard |
 | `recall.maxTotalRecallChars` | `0` | Total character budget for auto-recalled L1 memories; `0` disables this guard |
-| `recall.minQueryChars` | `6` | Min sanitized user-text length (Unicode code points) to trigger L1 memory search. Shorter messages (acknowledgments like "好的", "嗯", "ok", "对") skip L1 search; active scenes are still injected. `0` disables the gate; `2` restores the historical hard floor |
+| `recall.minQueryChars` | `6` | Min sanitized user-text length (Unicode code points) to trigger L1 memory search. Shorter messages (acknowledgments like "好的", "嗯", "ok", "对") skip L1 search. `0` disables the gate; `2` restores the historical hard floor |
 | `pipeline.everyNConversations` | `5` | Trigger an L1 memory extraction every N turns |
 | `extraction.maxMemoriesPerSession` | `20` | Max memories extracted per L1 pass |
 | `offload.enabled` | `false` | Whether to enable short-term compression |
@@ -205,6 +205,11 @@ Register the slot in your plugin config so OpenClaw routes context-offload reque
 | `pipeline.l1IdleTimeoutSeconds` | `600` | Trigger L1 after the user has been idle for this many seconds |
 | `pipeline.l2MinIntervalSeconds` | `900` | Minimum interval between two L2 passes within the same session |
 | `recall.timeoutMs` | `5000` | Recall timeout; on timeout, skip injection without blocking the conversation |
+| `recall.sessionMode` | `"drift"` | In-session recall policy. A conversation is usually one task: `drift` (default) primes the session on the first qualifying message, then each turn only checks drift against the anchor — same topic injects nothing (the priming block is already persisted in the transcript), a topic switch re-primes and injects only records not yet injected this session. `first-turn` primes once and never recalls mid-session; `every-turn` restores the legacy per-turn full recall (rollback switch) |
+| `recall.primingScoreThreshold` | `0.62` | Vector-score gate for session priming: memories are injected only when the best vector candidate reaches this threshold — chitchat / topics with no relevant history pass through completely clean. BGE-M3 calibrated (`0.58` wide / `0.65` strict) |
+| `recall.driftThreshold` | `0.5` | Cosine below which a mid-session message counts as a topic switch (drift mode only). Missed switches just keep the old topic's memories (tools can compensate); false switches inject noise — hence the conservative default |
+| `recall.sessionTtlMinutes` | `30` | Inactivity TTL for session recall state (anchors + injected ids); after it the next message re-primes. In-memory only |
+| `recall.sceneInjection` | `"off"` | Whether to auto-inject `<active-scenes>` (all TTL-active work themes) into the system prompt. `off` (default) never injects — scene awareness comes from the `[type\|scene]` tag on recalled lines + on-demand tools, keeping the system prompt byte-identical across sessions (best caching, no hot-topic pollution in `/new` conversations); `ambient` restores the legacy behavior |
 | `extraction.enableDedup` | `true` | L1 vector dedup / conflict detection |
 | `capture.excludeAgents` | `[]` | Glob patterns to exclude specific agents (e.g. `bench-judge-*`) |
 | `capture.l0l1RetentionDays` | `0` | Local retention days for L0 / L1 files; `0` = never clean up |

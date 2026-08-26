@@ -30,7 +30,7 @@ openclaw gateway restart       # 代码修改后重启生效
 ## 记忆工作原理
 
 ```
-用户发消息 ──► before_prompt_build (auto-recall) ──► 注入记忆/场景到 prompt
+用户发消息 ──► before_prompt_build (auto-recall) ──► 会话 priming / 漂移检测，注入记忆到 prompt
 agent 回合结束 ──► agent_end (auto-capture)      ──► 写 L0
                      │
                      ▼
@@ -58,10 +58,13 @@ agent 回合结束 ──► agent_end (auto-capture)      ──► 写 L0
 
 ### 读路径
 
-- **自动召回**（`before_prompt_build` → `src/core/hooks/auto-recall.ts`，5s 超时保护）：按策略搜索 L1 —— keyword（FTS5 BM25）/ embedding（余弦）/ hybrid（默认，RRF k=60 合并）。阈值按 BGE-M3 校准且分路解耦：向量 `scoreThreshold`（默认 0.55，实测校准）、FTS `ftsScoreThreshold`（默认 0.35，BM25 归一化分度尺，与余弦不可比）。注入分两段：
-  - `<relevant-memories>`（动态，每轮变）→ 前置到**用户 prompt**，不破坏 system prompt 缓存；`persistToTranscript` 默认开启时由 `before_message_write` hook 持久化写入用户消息 JSONL，而非仅运行时 prompt 前缀
-  - `<active-scenes>`（TTL 内全部活跃工作主题：标题+活动区间+一句话现状+记忆条数，不限个数、按最近活动排序）+ 工具指南（稳定）→ 追加到 **system prompt 尾部**，命中 prompt cache
+- **自动召回**（`before_prompt_build` → `src/core/hooks/auto-recall.ts`，5s 超时保护）——**会话锚定模式**（`recall.sessionMode`，默认 `drift`）：一个会话通常是一个任务，召回以会话为单位锚定，而非每轮用最新消息重跑（旧模式的措辞漂移会把无关记忆混进 prompt）：
+  - **会话 priming**（首条通过 `minQueryChars` 的消息触发一次）：按策略搜索 L1 —— keyword（FTS5 BM25）/ embedding（余弦）/ hybrid（默认，RRF k=60 合并），阈值分路解耦：向量 `scoreThreshold`（默认 0.55）、FTS `ftsScoreThreshold`（默认 0.35，BM25 分度尺与余弦不可比）。priming 有**向量闸门** `primingScoreThreshold`（默认 0.62，BGE-M3 实测校准）：候选最高向量分达标才注入，否则整体放过——闲聊、无历史的新任务零污染。锚点（首条消息 embedding + 已注入 record_id）存入 `RecallSessionTracker`（`recall-session.ts`，纯内存，TTL `sessionTtlMinutes` 默认 30min 不活动过期）
+  - **漂移检测**（后续每轮，消息过 `minQueryChars` 时）：embed 当前消息与锚点比余弦——≥ `driftThreshold`（默认 0.5）同任务 → 跳过召回（priming 已持久化在转录里）；低于阈值 → 换任务：无条件重锚点 + 重新 priming（闸门同样生效），按 record_id 去重只注入新增。embed 失败保守跳过（宁可不召回也不注入脏内容）；无 embedding 部署退化 bigram 文本相似度；历史压缩（消息数骤降 >20）强制重 priming 并重置去重
+  - `<relevant-memories>`（priming 轮注入）→ 前置到**用户 prompt**；`persistToTranscript` 默认开启时由 `before_message_write` 持久化写入用户消息 JSONL，后续轮次转录里天然可见
+  - 工具指南（静态、跨会话字节一致）→ 追加到 **system prompt 尾部**，命中 prompt cache。`recall.sceneInjection` 默认 `off`：`<active-scenes>` **不再自动注入**（`ambient` 可回退旧行为），场景感知来自记忆行 `[type|scene]` 标记 + 工具按需检索——system prompt 跨会话完全一致，`/new` 后不会被无关热点主题污染
   - 注入行是紧凑格式：`[type|scene] 内容前 60 字提示 [id=m_xxx]`，agent 按需取全文
+  - 回退开关：`sessionMode="every-turn"` 恢复旧的逐轮完整召回行为（不经 tracker，行为逐字节一致）
 - **主动检索工具**（`src/tools/`）：`tdai_memory_search`（L1 hybrid 搜索）、`tdai_memory_get`（按 record_id 取全文）、`tdai_conversation_search`（L0 原文检索）。指南限制每轮合计最多 5 次调用。
 
 ### 存储
@@ -86,7 +89,7 @@ src/core/
     scene-format.ts       # v2 场景文件格式 + v1 迁移
     scene-navigation.ts   # system prompt 注入视图（TTL 过滤）
     scene-index.ts        # scene_index.json 读写/重建
-  hooks/              # auto-recall / auto-capture hooks
+  hooks/              # auto-recall / auto-capture / recall-session（会话锚点状态）hooks
   store/              # SQLite 向量库 + embedding + BM25 + 工厂
   prompts/            # L1 提取/去重 + L2 综合提示词
   profile/            # L2 profile 本地 ↔ store 同步
