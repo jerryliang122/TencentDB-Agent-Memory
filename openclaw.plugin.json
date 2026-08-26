@@ -40,7 +40,7 @@
       },
       "scene": {
         "type": "object",
-        "description": "场景归纳设置 (L2)",
+        "description": "场景归纳设置 (L2)。原 \"persona\" 段已更名为 \"scene\"——把 openclaw.json 里的 \"persona\" 键改为 \"scene\"（段内字段名不变），未改名则本段全部走默认值",
         "properties": {
           "model": { "type": "string", "description": "场景生成模型 (格式: provider/model)，未填写时使用openclaw默认模型" },
           "sceneMaxChars": { "type": "number", "default": 2000, "description": "单场景文件字符上限（工程强制截断）" },

@@ -40,3 +40,41 @@ describe("parseConfig legacy tcvdb warnings", () => {
     expect(cfg.capture.enabled).toBe(true);
   });
 });
+
+describe("parseConfig legacy persona/scene migration warnings", () => {
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+  });
+
+  it("warns with rename instruction when the persona section is present", () => {
+    parseConfig({ persona: { sceneTtlDays: 7 } });
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0][0]).toMatch(/"persona".*"scene"/);
+    expect(warnSpy.mock.calls[0][0]).toMatch(/inner field names are unchanged/);
+  });
+
+  it("warns listing removed keys found inside the scene section", () => {
+    parseConfig({ scene: { triggerEveryN: 50, maxScenes: 6, sceneTtlDays: 30 } });
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0][0]).toMatch(/triggerEveryN, maxScenes/);
+    expect(warnSpy.mock.calls[0][0]).not.toMatch(/sceneTtlDays/);
+  });
+
+  it("detects removed keys inside the legacy persona section too", () => {
+    parseConfig({ persona: { l3InjectTopK: 5 } });
+    // Two warns: section rename + removed keys
+    expect(warnSpy).toHaveBeenCalledTimes(2);
+    expect(warnSpy.mock.calls[1][0]).toMatch(/l3InjectTopK/);
+  });
+
+  it("does not warn for a clean scene section", () => {
+    parseConfig({ scene: { sceneTtlDays: 30, model: "my/glm-5" } });
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+});

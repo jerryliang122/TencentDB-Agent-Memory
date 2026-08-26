@@ -490,6 +490,45 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
     );
   }
 
+  // --- Legacy persona section detection (renamed to `scene`) ---
+  // No alias parsing is kept (full fork divergence), so a config still using
+  // "persona": {...} would silently lose every scene setting to defaults.
+  // Warn with the exact rename instruction.
+  if ("persona" in c) {
+    console.warn(
+      `[memory-tdai] Config section "persona" was renamed to "scene" (all L3 persona ` +
+      `settings were removed; every remaining field is scene/L2 configuration). ` +
+      `Rename the key in openclaw.json: "persona": { ... } → "scene": { ... } ` +
+      `(inner field names are unchanged). Until renamed, ALL scene settings fall ` +
+      `back to defaults (including scene.model).`,
+    );
+  }
+
+  // --- Removed persona-era keys detection (no consumers after the fork purge) ---
+  const legacySceneKeys = [
+    "triggerEveryN",
+    "maxScenes",
+    "backupCount",
+    "sceneBackupCount",
+    "sceneInjectTopK",
+    "sceneInjectSummaryChars",
+    "l3InjectTopK",
+    "l3InjectSummaryChars",
+  ] as const;
+  const legacySceneSrc = c.scene ?? c.persona;
+  const sceneGroupForLegacy =
+    legacySceneSrc && typeof legacySceneSrc === "object" && !Array.isArray(legacySceneSrc)
+      ? (legacySceneSrc as Record<string, unknown>)
+      : {};
+  const foundLegacyKeys = legacySceneKeys.filter((k) => k in sceneGroupForLegacy);
+  if (foundLegacyKeys.length > 0) {
+    console.warn(
+      `[memory-tdai] Config keys [${foundLegacyKeys.join(", ")}] were removed with the L3 ` +
+      `persona feature / v2 scene redesign and are ignored. Remove them from the plugin ` +
+      `config to silence this warning.`,
+    );
+  }
+
   // --- Capture (L0) ---
   const captureGroup = obj(c, "capture");
 

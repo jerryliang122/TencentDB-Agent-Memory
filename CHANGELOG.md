@@ -8,7 +8,7 @@
 
 ### ✨ 新功能
 
-- **配置段更名:`persona` → `scene`**：L3 清除后该段剩余 12 个字段全部是 L2 场景配置,段名纯属历史遗留。`PersonaConfig` → `SceneConfig`、`cfg.persona.*` → `cfg.scene.*`、schema 段同步更名。**配置迁移**：`openclaw.json` 中把 `"persona": { ... }` 改为 `"scene": { ... }`（段内字段名不变）;按分叉原则不保留 `persona` 别名解析,未改名则全部走默认值。注意:L1 记忆类型 `persona`（`persona|episodic|instruction` 三类标签之一）与配置段无关,不受影响。
+- **配置段更名:`persona` → `scene`**：L3 清除后该段剩余 12 个字段全部是 L2 场景配置,段名纯属历史遗留。`PersonaConfig` → `SceneConfig`、`cfg.persona.*` → `cfg.scene.*`、schema 段同步更名。**配置迁移**:`openclaw.json` 中把 `"persona": { ... }` 改为 `"scene": { ... }`(段内字段名不变);按分叉原则不保留 `persona` 别名解析,未改名则全部走默认值。**迁移指引已内建**:`parseConfig` 检测到旧的 `persona` 段会 warn 明确的改名指令;检测到已删除的旧键(`triggerEveryN`/`maxScenes`/`backupCount`/`sceneBackupCount`/`sceneInjectTopK`/`sceneInjectSummaryChars`/`l3InjectTopK`/`l3InjectSummaryChars`)会 warn 列出可删的键;schema 的 `scene` 段 description 也写明了改名来源。注意:L1 记忆类型 `persona`(`persona|episodic|instruction` 三类标签之一)与配置段无关,不受影响。
 
 ### 🗑️ 移除（彻底分叉：不再兼容上游，不回 PR）
 
