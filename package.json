@@ -91,9 +91,6 @@
     "build": {
       "openclawVersion": "2026.3.13",
       "pluginSdkVersion": "2026.3.13"
-    },
-    "bundle": {
-      "stageRuntimeDependencies": true
     }
   },
   "devDependencies": {
