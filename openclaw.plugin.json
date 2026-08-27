@@ -2,6 +2,7 @@
   "id": "memory-tencentdb",
   "name": "Memory (TencentDB)",
   "description": "Three-layer memory system — auto-captures, structures, and summarizes conversational knowledge using local LLM + SQLite vector search",
+  "kind": "memory",
   "activation": {
     "onStartup": true
   },

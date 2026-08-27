@@ -29,6 +29,7 @@ import { performAutoRecall } from "./src/core/hooks/auto-recall.js";
 import { RecallSessionTracker } from "./src/core/hooks/recall-session.js";
 import type { SessionRecallParams } from "./src/core/hooks/recall-session.js";
 import { performAutoCapture } from "./src/core/hooks/auto-capture.js";
+import { listSceneBlockArtifacts } from "./src/core/scene/public-artifacts.js";
 import {
   ensurePluginHookPolicy,
   decideHookPolicy,
@@ -171,6 +172,23 @@ export default definePluginEntry({
   initDataDirectories(pluginDataDir);
 
   const sessionFilter = new SessionFilter(cfg.capture.excludeAgents);
+
+  // Memory-slot capability (manifest kind: "memory"). The slot makes this
+  // plugin the host's active memory backend; deterministicRecallToolName
+  // points provider-owned direct lookup at our search tool, and
+  // publicArtifacts exposes TTL-active L2 scene blocks to host status
+  // surfaces. Optional-chained so older hosts without the seam stay loadable.
+  api.registerMemoryCapability?.({
+    deterministicRecallToolName: "tdai_memory_search",
+    publicArtifacts: {
+      async listArtifacts() {
+        return await listSceneBlockArtifacts({
+          pluginDataDir,
+          ttlDays: cfg.scene.sceneTtlDays,
+        });
+      },
+    },
+  });
 
   let vectorStore: IMemoryStore | undefined;
   let embeddingService: EmbeddingService | undefined;
@@ -371,7 +389,7 @@ export default definePluginEntry({
       } catch (err) {
         api.logger.error(`${TAG} [before_prompt_build] Auto-recall failed: ${err instanceof Error ? err.message : String(err)}`);
       }
-    });
+    }, { requiresToolAuthority: true });
   }
 
   api.on("before_message_write", (event, ctx) => {
@@ -502,12 +520,34 @@ export default definePluginEntry({
     });
   }
 
-  // Shutdown cleanup must run regardless of capture/recall config: the
-  // pipeline (SQLite store, embedding service) is created whenever recall or
-  // capture is active, and needs explicit teardown on gateway stop.
-  api.on("gateway_stop", async () => {
-    const GATEWAY_STOP_TIMEOUT_MS = 3_000;
-    const hookStartMs = Date.now();
+  // Official memory-plugin convention: per-session caches die with the
+  // session instead of waiting for the 10-minute TTL sweep.
+  api.on("session_end", (event, ctx) => {
+    const keys = new Set<string>();
+    if (ctx?.sessionKey) keys.add(ctx.sessionKey);
+    const e = event as Record<string, unknown>;
+    for (const k of [e.sessionKey, e.sessionId, e.nextSessionKey, e.nextSessionId]) {
+      if (typeof k === "string" && k) keys.add(k);
+    }
+    for (const key of keys) {
+      pendingOriginalPrompts.delete(key);
+      pendingRecallCache.delete(key);
+      pendingRecallEndTimestamps.delete(key);
+      pendingTranscriptInjection.delete(key);
+      recallSessions.delete(key);
+    }
+  });
+
+  // Shared shutdown path for service stop and gateway_stop — must stay
+  // idempotent because the host may invoke either (or both) on the way down.
+  // The pipeline (SQLite store, embedding service) is created whenever recall
+  // or capture is active and needs explicit teardown.
+  let shutdownStarted = false;
+  const runShutdownCleanup = async (): Promise<void> => {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
+    const SHUTDOWN_TIMEOUT_MS = 3_000;
+    const startMs = Date.now();
 
     await coreReady.catch(() => {});
 
@@ -519,12 +559,14 @@ export default definePluginEntry({
             sharedMemoryCleaner = undefined;
           }
         } catch (error) {
-          api.logger.error(`${TAG} [gateway_stop] memoryCleaner error: ${error instanceof Error ? error.message : String(error)}`);
+          api.logger.error(`${TAG} [shutdown] memoryCleaner error: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
 
       if (pipelineDestroy) {
-        await pipelineDestroy();
+        const destroy = pipelineDestroy;
+        pipelineDestroy = undefined;
+        await destroy();
       }
     };
 
@@ -533,18 +575,30 @@ export default definePluginEntry({
       await Promise.race([
         doCleanup(),
         new Promise<never>((_, reject) => {
-          timeoutId = setTimeout(() => reject(new Error("timeout")), GATEWAY_STOP_TIMEOUT_MS);
+          timeoutId = setTimeout(() => reject(new Error("timeout")), SHUTDOWN_TIMEOUT_MS);
         }),
       ]);
     } catch (err) {
-      api.logger.warn(`${TAG} [gateway_stop] Aborted: ${err instanceof Error ? err.message : String(err)}`);
+      api.logger.warn(`${TAG} [shutdown] Aborted: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       if (timeoutId !== undefined) clearTimeout(timeoutId);
     }
 
     resetStores();
-    api.logger.info(`${TAG} [gateway_stop] Cleanup finished (${Date.now() - hookStartMs}ms)`);
+    api.logger.info(`${TAG} [shutdown] Cleanup finished (${Date.now() - startMs}ms)`);
+  };
+
+  api.registerService({
+    id: "memory-tencentdb",
+    start: () => {
+      api.logger.info(`${TAG} memory service active (memory-slot plugin)`);
+    },
+    stop: runShutdownCleanup,
   });
+
+  // Belt-and-braces for hosts that stop plugins without service teardown;
+  // safe to run after service stop (idempotent).
+  api.on("gateway_stop", runShutdownCleanup);
 
   if (cfg.offload.enabled) {
     try {

@@ -67,7 +67,7 @@
   },
   "peerDependencies": {
     "node-llama-cpp": "^3.16.2",
-    "openclaw": ">=2026.3.7"
+    "openclaw": ">=2026.8.1-beta.3"
   },
   "peerDependenciesMeta": {
     "openclaw": {
@@ -85,18 +85,18 @@
       "./dist/index.mjs"
     ],
     "compat": {
-      "pluginApi": ">=2026.3.13",
-      "minGatewayVersion": ">=2026.3.13"
+      "pluginApi": ">=2026.8.1-beta.3",
+      "minGatewayVersion": ">=2026.8.1-beta.3"
     },
     "build": {
-      "openclawVersion": "2026.3.13",
-      "pluginSdkVersion": "2026.3.13"
+      "openclawVersion": "2026.8.1-beta.3",
+      "pluginSdkVersion": "2026.8.1-beta.3"
     }
   },
   "devDependencies": {
     "@types/node": "^25.5.2",
     "@vitest/coverage-v8": "^4.1.2",
-    "openclaw": "^2026.7.1-2",
+    "openclaw": "^2026.8.1-beta.3",
     "tsdown": "^0.21.10",
     "typescript": "^6.0.2",
     "vitest": "^4.1.2"

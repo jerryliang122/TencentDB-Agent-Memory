@@ -110,6 +110,11 @@ export class RecallSessionTracker {
     s.lastTs = now;
   }
 
+  /** Drop one session's anchor state immediately (session_end cleanup). */
+  delete(sessionKey: string): void {
+    this.sessions.delete(sessionKey);
+  }
+
   get size(): number {
     return this.sessions.size;
   }

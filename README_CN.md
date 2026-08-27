@@ -133,14 +133,21 @@ openclaw gateway restart
 
 默认使用本地 `SQLite + sqlite-vec` 后端。
 
+本插件是原生 OpenClaw **memory 插件**（清单 `"kind": "memory"`），接管宿主 memory slot。建议显式声明所有权，即使日后出现其他 memory 插件也能保持确定性：
+
 ```jsonc
 // ~/.openclaw/openclaw.json
 {
-  "memory-tencentdb": {
-    "enabled": true
+  "plugins": {
+    "slots": { "memory": "memory-tencentdb" },
+    "entries": {
+      "memory-tencentdb": { "enabled": true }
+    }
   }
 }
 ```
+
+要求 OpenClaw >= 2026.8.1-beta.3。隐身（incognito）会话按契约绝不捕获、绝不召回；L2 场景块会以 memory artifacts 形式发布到宿主状态面板。
 
 启用后，TencentDB Agent Memory 会自动完成对话录制、记忆提取、场景归纳，并以**会话锚定**方式召回：会话首条消息在高质量向量闸门保护下把相关过往知识 priming 进 prompt（闲聊与无关新话题完全放过、零污染），后续轮次只有检测到话题漂移才会再次注入。
 

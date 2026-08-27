@@ -2,6 +2,7 @@
 
 OpenClaw 插件（`memory-tencentdb`），为 AI 代理提供三层记忆系统：**L0 原始对话 → L1 结构化记忆 → L2 活跃工作主题**。
 
+- 原生 OpenClaw **memory 插件**：清单 `kind: "memory"`，接管 `plugins.slots.memory`；要求宿主 >= 2026.8.1-beta.3（隐身会话过滤、`requiresToolAuthority` 均依赖该版本 SDK）
 - 数据全部本地存储：SQLite（`vectors.db`）+ JSONL 文件，无外部数据库依赖
 - LLM / embedding 通过 OpenAI 兼容 API 调用（可选独立 endpoint，或复用 OpenClaw 内嵌 agent）
 - 读取时自动召回注入 + agent 主动检索工具，两层配合

@@ -136,14 +136,21 @@ openclaw gateway restart
 
 Defaults to a local `SQLite + sqlite-vec` backend.
 
+This plugin is a native OpenClaw **memory plugin** (`"kind": "memory"` in the manifest) and takes over the host memory slot. Make the ownership explicit so it stays deterministic even if another memory plugin appears later:
+
 ```jsonc
 // ~/.openclaw/openclaw.json
 {
-  "memory-tencentdb": {
-    "enabled": true
+  "plugins": {
+    "slots": { "memory": "memory-tencentdb" },
+    "entries": {
+      "memory-tencentdb": { "enabled": true }
+    }
   }
 }
 ```
+
+Requires OpenClaw >= 2026.8.1-beta.3. Incognito sessions are never captured or recalled (process-only by contract); scene blocks are published to host status surfaces as memory artifacts.
 
 Once enabled, TencentDB Agent Memory automatically handles conversation capture, memory extraction, scene consolidation, and session-anchored recall: the first message of a conversation primes relevant past knowledge into the prompt behind a high-similarity vector gate (chitchat and unrelated topics pass through clean), and later turns stay silent unless the topic drifts.
 
