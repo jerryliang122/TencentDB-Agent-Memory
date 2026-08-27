@@ -6,6 +6,8 @@
  * into a flat list of matchers at construction time — zero per-call overhead.
  */
 
+import { isIncognitoSessionKey } from "openclaw/plugin-sdk/routing";
+
 // ============================
 // Types
 // ============================
@@ -95,6 +97,8 @@ export class SessionFilter {
 
   /** Should this sessionKey be skipped? */
   shouldSkip(sessionKey: string): boolean {
+    // Incognito sessions are process-only by contract — no memory traces.
+    if (isIncognitoSessionKey(sessionKey)) return true;
     return this.matchers.some((m) => m(sessionKey));
   }
 
