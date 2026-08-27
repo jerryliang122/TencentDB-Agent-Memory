@@ -1111,9 +1111,11 @@ export function registerOffload(api: any, offloadConfig: OffloadConfig): void {
     }
   });
 
-  // before_agent_start (L4 + session fallback)
+  // before_agent_run (L4 + session fallback). Must be a valid PluginHookName —
+  // the pre-rename "before_agent_start" was silently ignored by OpenClaw
+  // 2026.8.1's isPluginHookName gate.
   const l4State = { pendingResult: null as any };
-  _trackedOn("before_agent_start", async (event: any, ctx: any) => {
+  _trackedOn("before_agent_run", async (event: any, ctx: any) => {
     if (isInternalMemorySession(ctx?.sessionKey)) return;
     const sk = ctx?.sessionKey;
     const mgr = sk ? await _resolveSession(sk, ctx?.sessionId) : null;

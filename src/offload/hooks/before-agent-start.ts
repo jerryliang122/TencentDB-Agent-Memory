@@ -1,5 +1,5 @@
 /**
- * before_agent_start hook handler.
+ * before_agent_run hook handler (registered in index.ts).
  * Implements L1.5: Task completion judgment and active MMD management.
  *
  * Backend-only mode: local LLM judge has been removed.
